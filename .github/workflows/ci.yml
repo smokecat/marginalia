@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: scripts/check lint
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            bash: bash
+          - os: macos-latest
+            bash: /bin/bash # macOS 自带的 bash 3.2，确保不依赖 bash 4+ 特性
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - run: npm install -g bats
+      - run: scripts/check test
+        env:
+          MARGINALIA_TEST_BASH: ${{ matrix.bash }}
