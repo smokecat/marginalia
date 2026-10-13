@@ -12,6 +12,8 @@ scripts/check     # shellcheck + Python 语法 + bats；没有全局安装时自
 
 测试会隔离 `HOME` 和 git 全局配置，不会读写你的真实环境。
 
+macOS 上 bats 本身需要 bash 4+（系统自带的 3.2 处理不了中文测试名），先 `brew install bash`；要验证 marginalia 在 3.2 下的行为，用 `MARGINALIA_TEST_BASH=/bin/bash scripts/check test`。
+
 ## 代码约定
 
 - **bash 3.2 兼容**：macOS 自带 bash 3.2，不要用关联数组、`mapfile`、`${var,,}` 等 bash 4+ 特性。CI 会在 macOS 上用 `/bin/bash` 跑一遍测试。

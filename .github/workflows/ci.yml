@@ -24,7 +24,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
-      - run: npm install -g bats
-      - run: scripts/check test
+      # bats 自身需要 bash 4+ 才能处理中文测试名；被测的 marginalia 仍由 MARGINALIA_TEST_BASH 指定为 /bin/bash 3.2
+      - if: runner.os == 'macOS'
+        run: brew install bash
+      - run: scripts/check test # bats 未安装时由 scripts/check 通过 npx 运行
         env:
           MARGINALIA_TEST_BASH: ${{ matrix.bash }}
