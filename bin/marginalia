@@ -1,0 +1,383 @@
+#!/usr/bin/env bash
+# marginalia — 项目私有工作区（.local/）的确定性操作。任何 agent 工具或人都可直接调用。
+set -euo pipefail
+
+MARGINALIA_HOME="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+TPL="$MARGINALIA_HOME/templates"
+TODAY="$(date +%F)"
+STATUSES="active paused blocked done"
+
+say() { printf '[%s] %s\n' "$1" "$2"; }
+die() { printf 'marginalia: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+用法：
+  marginalia setup                         本机一次性安装：skills 软链、marginalia 命令、各 agent 全局入口
+  marginalia init [选项] [目录]            在项目落地/修复/升级 .local 私有工作区（幂等）
+      --git-init                   目录不是 git 仓库时先 git init
+      --update-spec                用最新模板覆盖 .local/README.md 与 .local/templates/task.md
+      --create-claude-md           项目只有 AGENTS.md 时创建 CLAUDE.md（内容 @AGENTS.md，共享文件）
+      --migrate-memory             把 Claude 默认 auto memory 复制进 .local/memory/
+  marginalia task new <slug> [标题]        新建任务
+  marginalia task list                     列出未归档任务
+  marginalia task status <slug> <状态>     active | paused | blocked | done
+  marginalia task archive <slug> [结果] [--force]   归档（状态不是 done 时需 --force）
+
+输出中的 [ASK] 表示需要用户决定，[CONFLICT] 表示未自动处理的冲突。
+EOF
+}
+
+# 写入/替换文件中的 marginalia 托管标记块；块外内容不动
+upsert_block() { # <file> <content>
+  python3 - "$1" "$2" <<'PY'
+import os, sys
+path, body = sys.argv[1], sys.argv[2].strip("\n")
+S, E = "<!-- marginalia:start -->", "<!-- marginalia:end -->"
+# 旧版标记，遇到时整块替换为新标记
+for os_, oe in [("<!-- ws:local-workflow start -->", "<!-- ws:local-workflow end -->"), ("<!-- ws:start -->", "<!-- ws:end -->")]:
+    if os.path.exists(path):
+        t = open(path).read()
+        if os_ in t and oe in t:
+            open(path, "w").write(t.replace(os_, S).replace(oe, E))
+note = "<!-- 本标记块由 marginalia 托管，重跑 marginalia init/setup 会替换块内内容；自定义内容写在块外 -->"
+block = f"{S}\n{note}\n{body}\n{E}"
+if not os.path.exists(path):
+    open(path, "w").write(block + "\n"); print("CREATED")
+else:
+    txt = open(path).read()
+    if S in txt and E in txt:
+        i, j = txt.index(S), txt.index(E) + len(E)
+        if txt[i:j] == block:
+            print("SKIPPED")
+        else:
+            open(path, "w").write(txt[:i] + block + txt[j:]); print("UPDATED")
+    else:
+        open(path, "w").write(txt.rstrip("\n") + "\n\n" + block + "\n"); print("APPENDED")
+PY
+}
+
+# 设置 frontmatter 字段（没有则追加到 frontmatter 末尾）
+fm_set() { # <file> <key> <value>
+  python3 - "$@" <<'PY'
+import re, sys
+path, key, val = sys.argv[1:4]
+txt = open(path).read()
+m = re.match(r"---\n(.*?)\n---\n", txt, re.S)
+if not m:
+    sys.exit(f"marginalia: {path} 没有 frontmatter")
+lines = m.group(1).split("\n")
+for i, l in enumerate(lines):
+    if l.startswith(key + ":"):
+        lines[i] = f"{key}: {val}"; break
+else:
+    lines.append(f"{key}: {val}")
+open(path, "w").write("---\n" + "\n".join(lines) + "\n---\n" + txt[m.end():])
+PY
+}
+
+fm_get() { # <file> <key>
+  sed -n '1{/^---$/!q};2,/^---$/{/^'"$2"':/{s/^'"$2"':[[:space:]]*//;p;q}}' "$1"
+}
+
+link() { # <src> <dst>
+  local src=$1 dst=$2
+  if [ -L "$dst" ] && [ "$(readlink -f "$dst")" = "$(readlink -f "$src")" ]; then
+    say SKIPPED "$dst"
+  elif [ -L "$dst" ]; then
+    ln -sfn "$src" "$dst"; say FIXED "$dst → $src"
+  elif [ -e "$dst" ]; then
+    say CONFLICT "$dst 已存在且不是软链，未处理"
+  else
+    mkdir -p "$(dirname "$dst")"; ln -s "$src" "$dst"; say CREATED "$dst → $src"
+  fi
+}
+
+# ---------------------------------------------------------------- setup
+
+cmd_setup() {
+  local s name f
+  for s in "$MARGINALIA_HOME"/skills/*/; do
+    name=$(basename "$s")
+    link "${s%/}" "$HOME/.agents/skills/$name"   # Codex、Gemini CLI 等
+    link "${s%/}" "$HOME/.claude/skills/$name"   # Claude Code
+  done
+  link "$MARGINALIA_HOME/bin/marginalia" "$HOME/.local/bin/marginalia"
+
+  for f in "$HOME/.codex/AGENTS.md" "$HOME/.gemini/GEMINI.md"; do
+    if [ -d "$(dirname "$f")" ]; then
+      say "$(upsert_block "$f" "$(cat "$TPL/agent-global-block.md")")" "$f 全局入口"
+    else
+      say SKIPPED "$(dirname "$f") 不存在（该工具未安装，安装后重跑 marginalia setup）"
+    fi
+  done
+
+  # 改名前（ws）留下的软链
+  for f in "$HOME"/.agents/skills/ws-{init,task,kickoff} "$HOME"/.claude/skills/ws-{init,task,kickoff} "$HOME/.local/bin/ws"; do
+    if [ -L "$f" ] && readlink "$f" | grep -q '/_smoke/ws/'; then rm "$f"; say FIXED "移除旧名软链 $f"; fi
+  done
+  [ -e "$HOME/.claude/commands/ws" ] && say WARN "旧版命令 ~/.claude/commands/ws 仍在，会与新 skills 重复，建议删除"
+  [ -e "$HOME/.claude/ws-templates" ] && say WARN "旧版模板 ~/.claude/ws-templates 仍在，可删除"
+  return 0
+}
+
+# ---------------------------------------------------------------- init
+
+cmd_init() {
+  local git_init=0 update_spec=0 create_claude=0 migrate=0 dir=""
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --git-init) git_init=1 ;;
+      --update-spec) update_spec=1 ;;
+      --create-claude-md) create_claude=1 ;;
+      --migrate-memory) migrate=1 ;;
+      -*) die "未知选项 $1" ;;
+      *) dir=$1 ;;
+    esac
+    shift
+  done
+  dir=$(cd "${dir:-.}" && pwd) || die "目录不存在：$dir"
+
+  local ROOT
+  if ROOT=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null); then
+    [ "$(basename "$ROOT")" = .local ] && die "当前在 .local 仓库内，请在项目根运行"
+  elif [ $git_init = 1 ]; then
+    git -C "$dir" init -q; ROOT=$dir; say CREATED "主仓库 git init：$ROOT"
+  else
+    say ASK "$dir 不是 git 仓库，私有排除依赖 git。确认要在这里初始化后，加 --git-init 重跑"
+    exit 3
+  fi
+  local L="$ROOT/.local" changed=() d f MAIN
+  say INFO "项目根：$ROOT"
+
+  # worktree 与主工作区共享同一个 .local（和 Claude auto memory 跨 worktree 共享的行为一致）
+  MAIN=$(dirname "$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir)")
+  if [ "$MAIN" != "$ROOT" ]; then
+    [ -d "$MAIN/.local" ] || die "这是 $MAIN 的 worktree，先在主工作区运行 marginalia init"
+    if [ -L "$L" ] && [ "$(readlink -f "$L")" = "$(readlink -f "$MAIN/.local")" ]; then
+      say SKIPPED ".local → $MAIN/.local"; L="$MAIN/.local"
+    elif [ -e "$L" ]; then
+      say CONFLICT "worktree 里已有独立的 .local，未改为与主工作区共享"
+    else
+      ln -s "$MAIN/.local" "$L"; say CREATED ".local → $MAIN/.local（与主工作区共享）"; L="$MAIN/.local"
+    fi
+  fi
+
+  # 1. .local 骨架与模板
+  for d in tasks/archived docs ops scripts templates memory out logs tmp; do mkdir -p "$L/$d"; done
+  copy_tpl() { # <模板> <.local 内相对路径> <是否托管规范>
+    local src=$1 rel=$2 managed=$3 dst="$L/$2"
+    if [ ! -e "$dst" ]; then
+      cp "$src" "$dst"; changed+=("$rel"); say CREATED ".local/$rel"
+    elif [ "$managed" = 1 ] && ! cmp -s "$src" "$dst"; then
+      if [ $update_spec = 1 ]; then
+        cp "$src" "$dst"; changed+=("$rel"); say UPDATED ".local/$rel（旧版可在 .local git 历史中找回）"
+      else
+        say ASK ".local/$rel 与最新模板不同（diff -u $dst $src 查看）；更新加 --update-spec"
+      fi
+    fi
+  }
+  copy_tpl "$TPL/local/README.md" README.md 1
+  copy_tpl "$TPL/local/task.md" templates/task.md 1
+  copy_tpl "$TPL/local/gitignore" .gitignore 0
+  copy_tpl "$TPL/local/todo.md" todo.md 0
+  copy_tpl "$TPL/local/MEMORY.md" memory/MEMORY.md 0
+
+  if [ ! -d "$L/.git" ]; then
+    git -C "$L" init -q -b main; say CREATED ".local git 仓库"
+  fi
+
+  # 2. 私有排除（.git/info/exclude，worktree 共用；.local 不带尾斜杠，以便匹配 worktree 里的软链）
+  local EX added=0 p
+  EX=$(cd "$ROOT" && realpath -m "$(git rev-parse --git-path info/exclude)")
+  mkdir -p "$(dirname "$EX")"; touch "$EX"
+  for p in .local CLAUDE.local.md .claude/settings.local.json '.claude/skills/local-*' .claude/commands/local/ \
+           '.claude/agents/local-*.md' '.claude/rules/local-*.md' '.agents/skills/local-*'; do
+    if ! grep -qxF -- "$p" "$EX"; then
+      [ $added = 0 ] && printf '\n# marginalia: private workspace\n' >> "$EX"
+      echo "$p" >> "$EX"; added=$((added + 1))
+    fi
+  done
+  [ $added -gt 0 ] && say CREATED "exclude 规则 $added 条 → $EX" || say SKIPPED "exclude 规则已齐全"
+  local tracked
+  tracked=$(git -C "$ROOT" ls-files -- .local CLAUDE.local.md .claude/settings.local.json)
+  [ -n "$tracked" ] && say CONFLICT "以下私有路径已被主仓库跟踪，exclude 不生效（未擅自 git rm --cached）：$(echo $tracked)"
+
+  # 3. CLAUDE.md / AGENTS.md / CLAUDE.local.md
+  local has_claude=0 imports=0 has_agents=0
+  [ -f "$ROOT/AGENTS.md" ] && has_agents=1
+  for f in "$ROOT/CLAUDE.md" "$ROOT/.claude/CLAUDE.md"; do
+    if [ -f "$f" ]; then
+      has_claude=1
+      grep -qE '^[[:space:]]*@(\./)?AGENTS\.md[[:space:]]*$' "$f" && imports=1
+    fi
+  done
+  if [ $has_agents = 1 ] && [ $has_claude = 0 ]; then
+    if [ $create_claude = 1 ]; then
+      printf '@AGENTS.md\n' > "$ROOT/CLAUDE.md"; has_claude=1; imports=1
+      say CREATED "CLAUDE.md（@AGENTS.md）——共享文件，需要提交到主仓库"
+    else
+      say ASK "项目只有 AGENTS.md。建议创建共享的 CLAUDE.md（内容 @AGENTS.md），加 --create-claude-md；在此之前 CLAUDE.local.md 托管块内会带 @AGENTS.md 兜底"
+    fi
+  elif [ $has_agents = 1 ] && [ $imports = 0 ]; then
+    say WARN "CLAUDE.md 没有 import AGENTS.md，Claude 不会读 AGENTS.md；建议在 CLAUDE.md 中加一行 @AGENTS.md"
+  fi
+  local block
+  block=$(cat "$TPL/claude-local-block.md")
+  # 项目没有 CLAUDE.md 时，CLAUDE.local.md 的存在会让 Claude 不读 AGENTS.md，这里 import 兜底（文件不存在时会被静默跳过）
+  [ $has_claude = 0 ] && block+=$'\n\n@AGENTS.md'
+  say "$(upsert_block "$ROOT/CLAUDE.local.md" "$block")" "CLAUDE.local.md 托管块"
+
+  # 4. Claude auto memory 指向 .local/memory（必须是绝对路径）
+  mkdir -p "$ROOT/.claude"
+  local r
+  r=$(python3 - "$ROOT/.claude/settings.local.json" "$L/memory" <<'PY'
+import json, os, sys
+path, want = sys.argv[1], sys.argv[2]
+data = {}
+if os.path.exists(path):
+    try:
+        data = json.load(open(path))
+    except Exception:
+        print("CONFLICT 无法解析，未修改"); sys.exit()
+cur = data.get("autoMemoryDirectory")
+if cur == want:
+    print("SKIPPED")
+elif cur and not cur.rstrip("/").endswith("/.local/memory"):
+    print(f"CONFLICT 已指向 {cur}，未修改")
+else:
+    data["autoMemoryDirectory"] = want
+    with open(path, "w") as fh:
+        json.dump(data, fh, indent=2, ensure_ascii=False); fh.write("\n")
+    print("FIXED 路径已更新" if cur else "CREATED")
+PY
+)
+  say "${r%% *}" ".claude/settings.local.json autoMemoryDirectory → $L/memory${r#"${r%% *}"}"
+
+  # 5. 迁移 Claude 默认 auto memory
+  local old
+  old="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/$(printf '%s' "$MAIN" | sed 's/[^A-Za-z0-9]/-/g')/memory"
+  if [ -d "$old" ] && [ -n "$(ls -A "$old")" ]; then
+    if [ $migrate = 1 ]; then
+      for f in "$old"/*; do
+        local base; base=$(basename "$f")
+        if [ "$base" = MEMORY.md ] && cmp -s "$L/memory/MEMORY.md" "$TPL/local/MEMORY.md"; then
+          cp "$f" "$L/memory/MEMORY.md"
+        elif [ -e "$L/memory/$base" ]; then
+          say WARN "memory/$base 已存在，未覆盖（旧文件：$f）"; continue
+        else
+          cp -r "$f" "$L/memory/"
+        fi
+        changed+=("memory/$base")
+      done
+      say MIGRATED "$old → .local/memory/（原目录保留，确认无误后可删除）"
+    else
+      say ASK "Claude 默认 auto memory 目录有内容：$old；迁移进 .local/memory/ 加 --migrate-memory"
+    fi
+  fi
+
+  # 6. 旧版残留
+  local sk="$ROOT/.claude/skills/local-workflow"
+  if [ -L "$sk" ] && readlink "$sk" | grep -q ws-templates; then
+    rm "$sk"; say FIXED "移除旧版项目级 skill 软链 .claude/skills/local-workflow"
+  fi
+  [ -f "$ROOT/.gitignore" ] && grep -qE '^(\.local/?|CLAUDE\.local\.md)$' "$ROOT/.gitignore" &&
+    say WARN "主仓库 .gitignore 里有旧版私有规则（.local/、CLAUDE.local.md 等），现已由 exclude 承担，可以移除"
+  for f in tasks/README.md tasks/archived/README.md; do
+    [ -f "$L/$f" ] && say WARN ".local/$f 是旧版索引，状态现以任务 frontmatter 为准，可以删除"
+  done
+  [ -f "$L/learnings.md" ] && say WARN ".local/learnings.md 是旧版经验库，建议整理进 .local/memory/ 后删除"
+
+  # 7. commit 本次在 .local 中的变更
+  if [ ${#changed[@]} -gt 0 ]; then
+    lcommit "$L" "chore: marginalia init" "${changed[@]}"
+  fi
+
+  if ! ls -d "$L"/tasks/*/ 2>/dev/null | grep -vq '/archived/$'; then
+    say INFO "还没有任务。预计一周以上的新项目可以走 marginalia-kickoff 启动引导"
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------- task
+
+# 在 .local 仓库里只提交指定路径
+lcommit() { # <.local> <message> <paths...>
+  local L=$1 msg=$2 p; shift 2
+  for p in "$@"; do git -C "$L" add -A -- "$p" 2>/dev/null || true; done
+  if git -C "$L" diff --cached --quiet; then return 0; fi
+  git -C "$L" commit -q -m "$msg" && say COMMITTED "$msg"
+}
+
+find_local() {
+  local top
+  top=$(git rev-parse --show-toplevel 2>/dev/null) || die "不在 git 项目中"
+  [ "$(basename "$top")" = .local ] && top=$(dirname "$top")
+  L="$top/.local"
+  [ -d "$L" ] || die "项目没有 .local/，先运行 marginalia init"
+}
+
+valid_slug() { [[ $1 =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || die "slug 需为 kebab-case：$1"; }
+
+cmd_task() {
+  local L sub=${1:-list}; shift || true
+  find_local
+  case $sub in
+    new)
+      local slug=${1:?需要 slug}; shift; valid_slug "$slug"
+      local title=${*:-$slug} dst="$L/tasks/$slug" tpl="$L/templates/task.md" content
+      [ -e "$dst" ] || [ -e "$L/tasks/archived/$slug" ] && die "任务已存在：$slug"
+      [ -f "$tpl" ] || tpl="$TPL/local/task.md"
+      content=$(<"$tpl")
+      content=${content//'{{TITLE}}'/"$title"}
+      content=${content//'{{DATE}}'/"$TODAY"}
+      mkdir -p "$dst"; printf '%s\n' "$content" > "$dst/README.md"
+      say CREATED "$dst/README.md"
+      lcommit "$L" "task($slug): create" "tasks/$slug"
+      ;;
+    list)
+      local f n=0 slug state
+      printf '%-28s %-8s %-11s %s\n' TASK STATUS UPDATED 当前状态
+      for f in "$L"/tasks/*/README.md; do
+        [ -e "$f" ] || continue
+        slug=$(basename "$(dirname "$f")"); [ "$slug" = archived ] && continue
+        state=$(sed -n 's/^- \*\*当前状态\*\*[：:][[:space:]]*//p' "$f" | head -1)
+        printf '%-28s %-8s %-11s %s\n' "$slug" "$(fm_get "$f" status)" "$(fm_get "$f" updated)" "$state"
+        n=$((n + 1))
+      done
+      [ $n = 0 ] && echo "（没有未归档任务）"
+      echo "已归档：$(find "$L/tasks/archived" -mindepth 1 -maxdepth 1 -type d | wc -l) 个"
+      ;;
+    status)
+      local slug=${1:?需要 slug} st=${2:?需要状态} f
+      f="$L/tasks/$slug/README.md"; [ -f "$f" ] || die "没有任务：$slug"
+      [[ " $STATUSES " == *" $st "* ]] || die "状态须为：$STATUSES"
+      fm_set "$f" status "$st"; fm_set "$f" updated "$TODAY"
+      lcommit "$L" "task($slug): status → $st" "tasks/$slug"
+      ;;
+    archive)
+      local slug="" force=0 result=() a f
+      for a in "$@"; do
+        case $a in --force) force=1 ;; *) [ -z "$slug" ] && slug=$a || result+=("$a") ;; esac
+      done
+      [ -n "$slug" ] || die "需要 slug"
+      f="$L/tasks/$slug/README.md"; [ -f "$f" ] || die "没有任务：$slug"
+      local st; st=$(fm_get "$f" status)
+      [ "$st" = done ] || [ $force = 1 ] || die "任务状态是 $st 不是 done；确认要归档的话加 --force"
+      fm_set "$f" archived "$TODAY"; fm_set "$f" updated "$TODAY"
+      [ ${#result[@]} -gt 0 ] && fm_set "$f" result "${result[*]}"
+      mv "$L/tasks/$slug" "$L/tasks/archived/$slug"
+      say ARCHIVED "tasks/archived/$slug"
+      lcommit "$L" "archive($slug)" "tasks/$slug" "tasks/archived/$slug"
+      ;;
+    *) die "未知子命令：task $sub" ;;
+  esac
+}
+
+case ${1:-} in
+  setup) shift; cmd_setup "$@" ;;
+  init) shift; cmd_init "$@" ;;
+  task) shift; cmd_task "$@" ;;
+  -h|--help|help|"") usage ;;
+  *) usage; exit 1 ;;
+esac
