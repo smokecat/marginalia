@@ -138,7 +138,7 @@ cmd_init() {
       cp "$src" "$dst"; changed="$changed $rel"; say CREATED ".local/$rel"
     elif [ "$managed" = 1 ] && ! cmp -s "$src" "$dst"; then
       if [ $update_spec = 1 ]; then
-        cp "$src" "$dst"; changed="$changed $rel"; say UPDATED ".local/$rel（旧版可在 .local git 历史中找回）"
+        cp "$src" "$dst"; changed="$changed $rel"; say UPDATED ".local/${rel}（旧版可在 .local git 历史中找回）"
       else
         say ASK ".local/$rel 与最新模板不同（diff -u $dst $src 查看）；更新加 --update-spec"
       fi
@@ -210,7 +210,7 @@ cmd_init() {
         if [ "$base" = MEMORY.md ] && cmp -s "$L/memory/MEMORY.md" "$TPL/local/MEMORY.md"; then
           cp "$f" "$L/memory/MEMORY.md"
         elif [ -e "$L/memory/$base" ]; then
-          say WARN "memory/$base 已存在，未覆盖（旧文件：$f）"; continue
+          say WARN "memory/$base 已存在，未覆盖（旧文件：${f}）"; continue
         else
           cp -R "$f" "$L/memory/"
         fi
@@ -218,7 +218,7 @@ cmd_init() {
       done
       say MIGRATED "$old → .local/memory/（原目录保留，确认无误后可删除）"
     else
-      say ASK "Claude 默认 auto memory 目录有内容：$old；迁移进 .local/memory/ 加 --migrate-memory"
+      say ASK "Claude 默认 auto memory 目录有内容：${old}；迁移进 .local/memory/ 加 --migrate-memory"
     fi
   fi
 

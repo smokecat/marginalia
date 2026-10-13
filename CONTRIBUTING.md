@@ -16,7 +16,7 @@ macOS 上 bats 本身需要 bash 4+（系统自带的 3.2 处理不了中文测�
 
 ## 代码约定
 
-- **bash 3.2 兼容**：macOS 自带 bash 3.2，不要用关联数组、`mapfile`、`${var,,}` 等 bash 4+ 特性。CI 会在 macOS 上用 `/bin/bash` 跑一遍测试。
+- **bash 3.2 兼容**：macOS 自带 bash 3.2，不要用关联数组、`mapfile`、`${var,,}` 等 bash 4+ 特性。变量后面紧跟中文等非 ASCII 字符时必须写成 `${var}`，否则 bash 3.2 会把这些字节当成变量名的一部分（`scripts/check lint` 会检查）。CI 会在 macOS 上用 `/bin/bash` 跑一遍测试。
 - **避开 GNU/BSD 差异**：文本、JSON、路径处理放进 `lib/helpers.py`（Python 3.8+，只用标准库），不要依赖 `sed -i`、`readlink -f`、`realpath -m` 这类在两个平台上行为不同的命令。
 - **shellcheck 零警告**。
 - **零痕迹**：除了 `--create-claude-md`，任何操作都不能修改主仓库中受版本控制的文件。

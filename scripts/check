@@ -15,6 +15,16 @@ tool() { # <命令名>：输出可执行的命令前缀
 lint() {
   $(tool shellcheck) bin/marginalia scripts/check
   python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' lib/helpers.py
+  # bash 3.2 会把紧跟在 $var 后的非 ASCII 字节当成变量名的一部分，必须写成 ${var}
+  python3 - bin/marginalia scripts/check <<'PY'
+import re, sys
+bad = [(p, n + 1, line.strip()) for p in sys.argv[1:]
+       for n, line in enumerate(open(p, encoding="utf-8"))
+       if re.search(r"\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7f]", line)]
+for p, n, line in bad:
+    print("%s:%d: 变量后紧跟非 ASCII 字符，请写成 ${var}：%s" % (p, n, line))
+sys.exit(1 if bad else 0)
+PY
   echo "lint ok"
 }
 
