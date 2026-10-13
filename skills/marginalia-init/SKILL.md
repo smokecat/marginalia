@@ -1,6 +1,7 @@
 ---
 name: marginalia-init
 description: 在当前项目初始化、修复或升级 .local 私有工作区（跨会话任务持久化、各 agent 共享的经验库、ops 记录），只在用户明确要求时使用。幂等，可重复运行。
+license: MIT
 ---
 
 # marginalia-init

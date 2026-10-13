@@ -1,6 +1,7 @@
 ---
 name: marginalia-task
 description: 管理项目 .local 私有工作区中的持久化任务（新建、接续、列表、改状态、归档）。仅在项目根存在 .local/ 时适用。触发场景：开始一项明显会跨会话的工作；用户说"继续/接续 xx"，或提到之前没做完的工作；用户显式要求列出、归档任务或修改任务状态。
+license: MIT
 ---
 
 # marginalia-task

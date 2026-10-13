@@ -1,6 +1,7 @@
 ---
 name: marginalia-kickoff
 description: 新项目启动引导：需求澄清 → 背景盘点 → 技术调研 → 选型决策 → 目录规划，产出存入 .local/tasks/project-kickoff/，可中断接续。只在用户明确要求时使用，适合预计一周以上的项目（小项目直接开干）。
+license: MIT
 ---
 
 # marginalia-kickoff

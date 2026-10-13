@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# 本地检查：shellcheck + Python 语法 + bats 测试。
+# 用法：scripts/check [lint|test]；未全局安装 bats/shellcheck 时自动退回 bunx 或 npx。
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+tool() { # <命令名>：输出可执行的命令前缀
+  if command -v "$1" >/dev/null; then echo "$1"
+  elif command -v bunx >/dev/null; then echo "bunx $1"
+  elif command -v npx >/dev/null; then echo "npx --yes $1"
+  else echo "scripts/check: 找不到 $1，也没有 bunx/npx" >&2; exit 1
+  fi
+}
+
+lint() {
+  $(tool shellcheck) bin/marginalia scripts/check
+  python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' lib/helpers.py
+  echo "lint ok"
+}
+
+run_tests() { $(tool bats) test/; }
+
+case ${1:-all} in
+  lint) lint ;;
+  test) run_tests ;;
+  all) lint; run_tests ;;
+  *) echo "用法：scripts/check [lint|test]" >&2; exit 1 ;;
+esac
