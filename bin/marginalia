@@ -313,6 +313,13 @@ cmd_task() {
       done
       [ $n -gt 0 ] || echo "（没有未归档任务）"
       for f in "$L"/tasks/archived/*/; do [ -d "$f" ] && archived=$((archived + 1)); done
+      if [ $with_archived = 1 ]; then
+        for f in "$L"/tasks/archived/*/README.md; do
+          [ -e "$f" ] || continue
+          printf '%-28s %-8s %-11s %s\n' "$(basename "$(dirname "$f")")" archived \
+            "$(helper fm-get "$f" archived)" "$(helper fm-get "$f" result)"
+        done
+      fi
       echo "已归档：$archived 个"
       ;;
     show)
@@ -349,6 +356,8 @@ cmd_task() {
       valid_slug "$slug"
       f="$L/tasks/$slug/README.md"
       if [ ! -f "$f" ] && [ -f "$L/tasks/archived/$slug/README.md" ]; then
+        # 已归档：上次移动后 commit 失败的话这里补交，否则什么都不做
+        lcommit "$L" "archive($slug)" "tasks/$slug" "tasks/archived/$slug"
         say SKIPPED "tasks/archived/$slug 已归档"
         return
       fi

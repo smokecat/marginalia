@@ -6,6 +6,7 @@ trine 以 `trine-ext <op>` 调用，stdin 一个 JSON，stdout 回一个 JSON；
 Python 3.8+，只用标准库。
 """
 
+import hashlib
 import json
 import os
 import subprocess
@@ -21,6 +22,10 @@ STATUS = {
     "done": ("完成", "success"),
 }
 ARCHIVED_SHOWN = 20
+# trine 对 stdout 的上限是 512 KB：视图留足余量，超出就截断并说明
+OUTPUT_BUDGET = 380 * 1024
+DETAIL_MAX = 4000
+TEXT_MAX = 300
 
 
 class NoStore(Exception):
@@ -46,9 +51,31 @@ def marginalia(*args):
 
 def load_tasks():
     data = json.loads(marginalia("task", "list", "--json", "--archived"))
+    store = data["store"]["id"]
+    for t in data["tasks"]:
+        t["store"] = store
     active = [t for t in data["tasks"] if not t["archived"]]
     archived = sorted((t for t in data["tasks"] if t["archived"]), key=lambda t: t.get("archivedAt") or t["updated"], reverse=True)
     return data, active, archived
+
+
+def project_root(cwd):
+    """会话所在 git 工作树的根（worktree 里也是该 worktree 的根，.local 是指向主工作区的软链）。"""
+    try:
+        out = subprocess.run(["git", "-C", cwd, "rev-parse", "--show-toplevel"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             universal_newlines=True, timeout=5)
+        top = out.stdout.strip()
+        if out.returncode == 0 and top:
+            return os.path.dirname(top) if os.path.basename(top) == ".local" else top
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return cwd
+
+
+def rel_path(task, ctx):
+    """任务 README 相对会话目录的路径（会话可能开在项目的子目录里）。"""
+    cwd = ctx.get("cwd") or os.getcwd()
+    return os.path.relpath(os.path.join(project_root(cwd), task["path"]), cwd)
 
 
 def badges(task):
@@ -59,14 +86,19 @@ def badges(task):
 
 
 def ref(task):
-    return {"ref": task["slug"], "label": task["title"][:120]}
+    # 带任务库身份：trine 给的 linkedSessions 不限目录，两个项目都有同名任务时不能串
+    return {"ref": "%s:%s" % (task["store"], task["slug"]), "label": task["title"][:120]}
+
+
+def item_id(slug):
+    return slug if len(slug) <= 120 else slug[:111] + "~" + hashlib.sha256(slug.encode("utf-8")).hexdigest()[:8]
 
 
 def resume_prompt(task):
     return "继续 %s 任务" % task["slug"]
 
 
-def detail(task):
+def detail(task, ctx):
     r = task["resume"]
     lines = ["**接续指引**", ""]
     for key, label in (("state", "当前状态"), ("blocker", "卡点"), ("next", "下一步"), ("files", "关键文件")):
@@ -75,8 +107,8 @@ def detail(task):
     if task.get("result"):
         lines.append("- 结果：%s" % task["result"])
     lines.append("")
-    lines.append("`%s`" % task["path"])
-    return "\n".join(lines)
+    lines.append("`%s`" % rel_path(task, ctx))
+    return "\n".join(lines)[:DETAIL_MAX]
 
 
 def item(task, ctx, in_session):
@@ -92,26 +124,27 @@ def item(task, ctx, in_session):
         if in_session:
             actions.append({"id": "resume-here", "label": "接续到本会话", "effects": [{"type": "prompt.send", "text": resume_prompt(task)}]})
     if in_session:
-        actions.append({"id": "insert", "label": "插入引用", "effects": [{"type": "prompt.insert", "text": task["path"]}]})
+        actions.append({"id": "insert", "label": "插入引用", "effects": [{"type": "prompt.insert", "text": rel_path(task, ctx)}]})
     if not task["archived"]:
         if task["status"] != "done":
             actions.append({"id": "status", "label": "标为完成", "invoke": {"params": {"slug": slug, "status": "done"}}})
         else:
             actions.append({"id": "status", "label": "重新打开", "invoke": {"params": {"slug": slug, "status": "active"}}})
             actions.append({"id": "archive", "label": "归档", "destructive": True, "invoke": {"params": {"slug": slug}}})
-    sessions = [s["id"] for s in ctx.get("linkedSessions", []) if any(l.get("ref") == slug for l in s.get("links", []))]
+    my_ref = ref(task)["ref"]
+    sessions = [s["id"] for s in ctx.get("linkedSessions", []) if any(l.get("ref") == my_ref for l in s.get("links", []))]
     next_step = task["resume"].get("next") or task["resume"].get("state") or ""
     out = {
-        "id": slug,
-        "title": task["title"][:300],
+        "id": item_id(slug),
+        "title": task["title"][:TEXT_MAX],
         "badges": badges(task),
-        "meta": "更新于 %s" % task["updated"] if task["updated"] else slug,
-        "detail": detail(task)[:16000],
+        "meta": ("更新于 %s" % task["updated"] if task["updated"] else slug)[:TEXT_MAX],
+        "detail": detail(task, ctx),
         "link": ref(task),
         "actions": actions[:8],
     }
     if next_step:
-        out["subtitle"] = next_step[:500]
+        out["subtitle"] = next_step[:TEXT_MAX]
     if sessions:
         out["sessions"] = sessions[:20]
     return out
@@ -124,28 +157,53 @@ def linked_refs(ctx):
 def op_view(inp):
     ctx = inp["context"]
     in_session = ctx.get("session") is not None
-    _, active, archived = load_tasks()
+    data, active, archived = load_tasks()
     linked = linked_refs(ctx)
+    is_linked = lambda t: ref(t)["ref"] in linked  # noqa: E731
+    known = set(STATUS)
     groups = [
-        ("linked", "已关联", [t for t in active + archived if t["slug"] in linked], False),
-        ("active", "进行中", [t for t in active if t["status"] == "active" and t["slug"] not in linked], False),
-        ("waiting", "暂停 / 阻塞", [t for t in active if t["status"] in ("paused", "blocked") and t["slug"] not in linked], False),
-        ("done", "已完成", [t for t in active if t["status"] == "done" and t["slug"] not in linked], False),
-        ("archived", "已归档（最近 %d 个）" % ARCHIVED_SHOWN, [t for t in archived if t["slug"] not in linked][:ARCHIVED_SHOWN], True),
+        ("linked", "已关联", [t for t in active + archived if is_linked(t)], False),
+        ("active", "进行中", [t for t in active if t["status"] == "active" and not is_linked(t)], False),
+        ("waiting", "暂停 / 阻塞", [t for t in active if t["status"] in ("paused", "blocked") and not is_linked(t)], False),
+        ("done", "已完成", [t for t in active if t["status"] == "done" and not is_linked(t)], False),
+        ("other", "状态未知", [t for t in active if t["status"] not in known and not is_linked(t)], False),
+        ("archived", "已归档（最近 %d 个）" % ARCHIVED_SHOWN, [t for t in archived if not is_linked(t)][:ARCHIVED_SHOWN], True),
     ]
     sections = []
+    used = 0
+    truncated = False
     for sid, title, tasks, collapsed in groups:
         if sid != "linked" and not tasks:
             continue
         if sid == "linked" and not in_session:
             continue
-        section = {"id": sid, "title": title, "items": [item(t, ctx, in_session) for t in tasks][:200]}
+        items = []
+        for t in tasks[:200]:
+            entry = item(t, ctx, in_session)
+            size = len(json.dumps(entry, ensure_ascii=False).encode("utf-8"))
+            if used + size > OUTPUT_BUDGET:
+                truncated = True
+                break
+            used += size
+            items.append(entry)
+        section = {"id": sid, "title": title, "items": items}
         if collapsed:
             section["collapsed"] = True
         if sid == "linked":
             section["empty"] = "还没有关联任务。点任务右侧的关联按钮，或从会话菜单「关联…」。"
         sections.append(section)
-    return {"view": {"sections": sections, "empty": "这个项目还没有任务。"}}
+    errors = data.get("errors") or []
+    if errors:
+        sections.append({
+            "id": "errors",
+            "title": "无法读取",
+            "items": [{"id": item_id(e.get("slug", "?")), "title": e.get("slug", "?")[:TEXT_MAX], "subtitle": e.get("error", "")[:TEXT_MAX],
+                       "meta": e.get("path", "")[:TEXT_MAX], "badges": [{"text": "出错", "tone": "danger"}]} for e in errors[:50]],
+        })
+    view = {"sections": sections, "empty": "这个项目还没有任务。"}
+    if truncated:
+        view["title"] = "任务太多，只显示了一部分"
+    return {"view": view}
 
 
 def op_badge(inp):
@@ -154,7 +212,7 @@ def op_badge(inp):
     if not linked:
         return {"badge": None}
     _, active, archived = load_tasks()
-    tasks = [t for t in active + archived if t["slug"] in linked]
+    tasks = [t for t in active + archived if ref(t)["ref"] in linked]
     if not tasks:
         return {"badge": None}
     first = tasks[0]
@@ -173,12 +231,17 @@ def op_pick(inp):
     if query:
         tasks = [t for t in tasks if query in t["slug"].lower() or query in t["title"].lower()]
     items = []
+    used = 0
+    ctx = inp.get("context") or {}
     for t in tasks[:500]:
-        entry = {"id": t["slug"], "title": t["title"][:300], "badges": badges(t), "link": ref(t)}
+        entry = {"id": item_id(t["slug"]), "title": t["title"][:TEXT_MAX], "badges": badges(t), "link": ref(t)}
         if t["resume"].get("next"):
-            entry["subtitle"] = t["resume"]["next"][:500]
+            entry["subtitle"] = t["resume"]["next"][:TEXT_MAX]
         if point == "composerAction":
-            entry["effects"] = [{"type": "prompt.insert", "text": t["path"]}, {"type": "links.add", "links": [ref(t)]}]
+            entry["effects"] = [{"type": "prompt.insert", "text": rel_path(t, ctx)}, {"type": "links.add", "links": [ref(t)]}]
+        used += len(json.dumps(entry, ensure_ascii=False).encode("utf-8"))
+        if used > OUTPUT_BUDGET:
+            break
         items.append(entry)
     return {"items": items}
 

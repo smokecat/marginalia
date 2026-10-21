@@ -332,20 +332,25 @@ ext() { # <op> <json>
   mg task new alpha 'Alpha 任务'
   mg task new beta
   mg task status beta paused
-  run ext view '{"op":"view","point":"sessionPanel","context":{"cwd":"x","session":{"id":"s1","links":[{"ref":"beta","label":"b"}]},"linkedSessions":[{"id":"s1","links":[{"ref":"beta","label":"b"}]}]}}'
+  local store
+  store=$(mg task list --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["store"]["id"])')
+  mkdir -p "$P/src"
+  run ext view '{"op":"view","point":"sessionPanel","context":{"cwd":"'"$P/src"'","session":{"id":"s1","links":[{"ref":"'"$store"':beta","label":"b"}]},"linkedSessions":[{"id":"s1","links":[{"ref":"'"$store"':beta","label":"b"}]},{"id":"other","links":[{"ref":"elsewhere:beta","label":"b"}]}]}}'
   [ "$status" -eq 0 ]
   python3 - "$output" <<'PY'
 import json, sys
 v = json.loads(sys.argv[1])["view"]
 secs = {s["id"]: s for s in v["sections"]}
 assert [i["id"] for i in secs["linked"]["items"]] == ["beta"], secs
-assert secs["linked"]["items"][0]["sessions"] == ["s1"]
+assert secs["linked"]["items"][0]["sessions"] == ["s1"]   # 别的任务库里的同名任务不算
 alpha = secs["active"]["items"][0]
 ids = [a["id"] for a in alpha["actions"]]
 assert ids[:3] == ["resume-new", "resume-here", "insert"], ids
 new = alpha["actions"][0]["effects"][0]
-assert new["type"] == "session.create" and new["prompt"] == "继续 alpha 任务" and new["links"] == [{"ref": "alpha", "label": "Alpha 任务"}]
-assert alpha["link"]["ref"] == "alpha"
+assert new["type"] == "session.create" and new["prompt"] == "继续 alpha 任务"
+assert new["links"][0]["label"] == "Alpha 任务" and new["links"][0]["ref"].endswith(":alpha")
+# 会话开在 src/ 里：插入的引用相对会话目录
+assert alpha["actions"][2]["effects"][0]["text"] == "../.local/tasks/alpha/README.md", alpha["actions"][2]
 PY
 }
 
@@ -354,8 +359,10 @@ PY
   mg init "$P"
   cd "$P"
   mg task new alpha 'Alpha 任务'
-  run ext badge '{"op":"badge","context":{"session":{"id":"s","links":[{"ref":"alpha","label":"old"}]}}}'
-  python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["badge"]["text"]=="进行中" and d["links"]==[{"ref":"alpha","label":"Alpha 任务"}], d' "$output"
+  local store
+  store=$(mg task list --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["store"]["id"])')
+  run ext badge '{"op":"badge","context":{"session":{"id":"s","links":[{"ref":"'"$store"':alpha","label":"old"}]}}}'
+  python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["badge"]["text"]=="进行中" and d["links"][0]["label"]=="Alpha 任务", d' "$output"
   run ext pick '{"op":"pick","point":"composerAction","context":{},"args":{"query":"alp"}}'
   python3 -c 'import json,sys; i=json.loads(sys.argv[1])["items"]; assert [e["type"] for e in i[0]["effects"]]==["prompt.insert","links.add"], i' "$output"
   run ext action '{"op":"action","context":{},"args":{"actionId":"status","params":{"slug":"alpha","status":"done"}}}'
@@ -365,6 +372,55 @@ PY
   [ -d "$P/.local/tasks/archived/alpha" ]
   run ext action '{"op":"action","context":{},"args":{"actionId":"archive","params":{"slug":"alpha"}}}'
   has '"ok": true'
+}
+
+@test "trine 扩展：缺 frontmatter 的任务进「无法读取」，不静默消失" {
+  init_repo "$P"
+  mg init "$P"
+  cd "$P"
+  mkdir -p "$P/.local/tasks/broken" && echo '# 没有 frontmatter' > "$P/.local/tasks/broken/README.md"
+  run mg task list --json
+  python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["tasks"]==[] and d["errors"][0]["slug"]=="broken", d' "$output"
+  run ext view '{"op":"view","point":"workspacePanel","context":{"cwd":"'"$P"'","linkedSessions":[]}}'
+  python3 -c 'import json,sys; s=json.loads(sys.argv[1])["view"]["sections"]; assert s[-1]["id"]=="errors" and s[-1]["items"][0]["title"]=="broken", s' "$output"
+}
+
+@test "trine 扩展：任务很多时按输出预算截断，不超过 trine 的 512 KB 上限" {
+  init_repo "$P"
+  mg init "$P"
+  cd "$P"
+  python3 - "$P/.local/tasks" <<'PY'
+import os, sys
+for i in range(200):
+    d = os.path.join(sys.argv[1], "t%03d" % i)
+    os.makedirs(d)
+    open(os.path.join(d, "README.md"), "w").write("---\nstatus: active\nupdated: 2026-10-21\n---\n# 任务 %d\n\n## 接续指引\n\n- **下一步**：%s\n" % (i, "很长的下一步" * 120))
+PY
+  ext view '{"op":"view","point":"workspacePanel","context":{"cwd":"'"$P"'","linkedSessions":[]}}' > "$BATS_TEST_TMPDIR/out.json"
+  [ "$(wc -c < "$BATS_TEST_TMPDIR/out.json")" -lt 524288 ]
+  python3 -c 'import json,sys; v=json.load(open(sys.argv[1]))["view"]; assert v["title"].startswith("任务太多") and v["sections"][0]["items"], v.get("title")' "$BATS_TEST_TMPDIR/out.json"
+}
+
+@test "task archive：已归档但上次 commit 失败时，重跑补交" {
+  init_repo "$P"
+  mg init "$P"
+  cd "$P"
+  mg task new late
+  mv "$P/.local/tasks/late" "$P/.local/tasks/archived/late"
+  run mg task archive late --force
+  [ "$status" -eq 0 ]
+  [ -z "$(git -C "$P/.local" status --porcelain)" ]
+}
+
+@test "task list --archived：文本输出也列出已归档任务" {
+  init_repo "$P"
+  mg init "$P"
+  cd "$P"
+  mg task new gone
+  mg task archive gone 搞定 --force
+  run mg task list --archived
+  has "gone"
+  has "archived"
 }
 
 # ------------------------------------------------------------------ setup / uninstall

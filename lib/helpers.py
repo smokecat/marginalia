@@ -176,9 +176,12 @@ def tasks_json(local, with_archived="0"):
             if not os.path.isfile(path):
                 continue
             try:
+                if FRONTMATTER.match(read(path)) is None:
+                    errors.append({"slug": name, "path": os.path.relpath(path, os.path.dirname(local)), "error": "缺少 frontmatter"})
+                    continue
                 tasks.append(task_info(local, path))
             except (OSError, UnicodeDecodeError) as exc:
-                errors.append({"slug": name, "error": str(exc)})
+                errors.append({"slug": name, "path": os.path.relpath(path, os.path.dirname(local)), "error": str(exc)})
     archived_dir = os.path.join(local, "tasks", "archived")
     archived = len([n for n in os.listdir(archived_dir) if os.path.isdir(os.path.join(archived_dir, n))]) if os.path.isdir(archived_dir) else 0
     return json.dumps({"v": 1, "store": store_info(local), "tasks": tasks, "archivedCount": archived, "errors": errors}, ensure_ascii=False)
