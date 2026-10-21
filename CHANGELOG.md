@@ -15,7 +15,7 @@
 - worktree 自动共享主工作区的 `.local`。
 - bats 测试套件与 `scripts/check`，CI 覆盖 Linux 和 macOS（bash 3.2）。
 - `marginalia task list --json [--archived]`、`marginalia task show <slug> --json`：机器可读的任务列表与详情（含接续指引、任务库身份）。
-- trine 扩展（`integrations/trine/`）：在 trine 的会话页查看任务、关联会话、一键接续。
+- trine 扩展（`integrations/trine/`）：在 trine 的会话页查看任务、关联会话、一键接续；新建会话时「从任务开始」（需要 trine agent 0.17.0）。
 
 ### 修复
 

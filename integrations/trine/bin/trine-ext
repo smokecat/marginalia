@@ -227,7 +227,8 @@ def op_pick(inp):
     point = inp.get("point")
     query = ((inp.get("args") or {}).get("query") or "").strip().lower()
     _, active, archived = load_tasks()
-    tasks = active if point == "composerAction" else active + archived
+    # 输入框入口和新建会话只列进行中的任务（已归档的不再接续）
+    tasks = active if point in ("composerAction", "newSession") else active + archived
     if query:
         tasks = [t for t in tasks if query in t["slug"].lower() or query in t["title"].lower()]
     items = []
@@ -239,6 +240,9 @@ def op_pick(inp):
             entry["subtitle"] = t["resume"]["next"][:TEXT_MAX]
         if point == "composerAction":
             entry["effects"] = [{"type": "prompt.insert", "text": rel_path(t, ctx)}, {"type": "links.add", "links": [ref(t)]}]
+        elif point == "newSession":
+            # 新建会话「从任务开始」：预填首条消息；关联由 trine 用 link 在建好后写入
+            entry["effects"] = [{"type": "prompt.insert", "text": resume_prompt(t)}]
         used += len(json.dumps(entry, ensure_ascii=False).encode("utf-8"))
         if used > OUTPUT_BUDGET:
             break

@@ -2,7 +2,7 @@
   "apiVersion": 1,
   "id": "marginalia",
   "name": "Marginalia 任务",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "显示项目 .local/ 里的任务，关联会话、一键接续",
   "entry": ["bin/trine-ext"],
   "contributes": {
@@ -10,7 +10,8 @@
     "workspacePanel": { "title": "任务", "icon": "list-checks" },
     "sessionBadge": true,
     "linkPicker": { "title": "关联任务", "multiple": true },
-    "composerAction": { "label": "任务", "icon": "list-checks" }
+    "composerAction": { "label": "任务", "icon": "list-checks" },
+    "newSession": { "title": "从任务开始", "icon": "list-checks" }
   },
   "capabilities": ["prompt.insert", "prompt.send", "session.create", "links.write", "invoke"]
 }

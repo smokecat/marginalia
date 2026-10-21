@@ -354,7 +354,7 @@ assert alpha["actions"][2]["effects"][0]["text"] == "../.local/tasks/alpha/READM
 PY
 }
 
-@test "trine 扩展：badge、pick（含输入框入口）与 action" {
+@test "trine 扩展：badge、pick（含输入框入口、新建会话）与 action" {
   init_repo "$P"
   mg init "$P"
   cd "$P"
@@ -365,6 +365,8 @@ PY
   python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["badge"]["text"]=="进行中" and d["links"][0]["label"]=="Alpha 任务", d' "$output"
   run ext pick '{"op":"pick","point":"composerAction","context":{},"args":{"query":"alp"}}'
   python3 -c 'import json,sys; i=json.loads(sys.argv[1])["items"]; assert [e["type"] for e in i[0]["effects"]]==["prompt.insert","links.add"], i' "$output"
+  run ext pick '{"op":"pick","point":"newSession","context":{"cwd":"'"$P"'"}}'
+  python3 -c 'import json,sys; i=json.loads(sys.argv[1])["items"]; assert i[0]["effects"]==[{"type":"prompt.insert","text":"继续 alpha 任务"}] and i[0]["link"]["ref"].endswith(":alpha"), i' "$output"
   run ext action '{"op":"action","context":{},"args":{"actionId":"status","params":{"slug":"alpha","status":"done"}}}'
   [ "$status" -eq 0 ]
   grep -qx "status: done" "$P/.local/tasks/alpha/README.md"
