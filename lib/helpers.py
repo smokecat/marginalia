@@ -4,6 +4,7 @@
 兼容 Python 3.8+，只用标准库。
 """
 
+import hashlib
 import json
 import os
 import re
@@ -96,6 +97,97 @@ def section_field(path, label):
     return m.group(1).strip() if m else ""
 
 
+RESUME_FIELDS = (("state", "当前状态"), ("blocker", "卡点"), ("next", "下一步"), ("files", "关键文件"))
+
+
+def front_matter(text):
+    m = FRONTMATTER.match(text)
+    out = {}
+    if m:
+        for line in m.group(1).split("\n"):
+            key, sep, value = line.partition(":")
+            if sep:
+                out[key.strip()] = value.strip()
+    return out
+
+
+def section(text, heading):
+    """`## <heading>` 小节的正文（到下一个二级标题为止），去掉 HTML 注释。"""
+    m = re.search(r"^## %s[ \t]*\n(.*?)(?=^## |\Z)" % re.escape(heading), text, re.M | re.S)
+    if not m:
+        return ""
+    return re.sub(r"<!--.*?-->", "", m.group(1), flags=re.S).strip()
+
+
+def field(text, label):
+    m = re.search(r"^- \*\*%s\*\*[：:][ \t]*(.*)$" % re.escape(label), text, re.M)
+    value = m.group(1).strip() if m else ""
+    return "" if value.startswith("<!--") else value
+
+
+def task_info(local, path, detail=False):
+    text = read(path)
+    fm = front_matter(text)
+    slug = os.path.basename(os.path.dirname(path))
+    title = re.search(r"^# (.+)$", text, re.M)
+    info = {
+        "slug": slug,
+        "title": title.group(1).strip() if title else slug,
+        "status": fm.get("status", ""),
+        "created": fm.get("created", ""),
+        "updated": fm.get("updated", ""),
+        "archived": os.path.basename(os.path.dirname(os.path.dirname(path))) == "archived",
+        "path": os.path.relpath(path, os.path.dirname(local)),
+        "resume": dict((key, field(text, label)) for key, label in RESUME_FIELDS),
+    }
+    if fm.get("result"):
+        info["result"] = fm["result"]
+    if fm.get("archived"):
+        info["archivedAt"] = fm["archived"]
+    if detail:
+        todo = section(text, "待办")
+        info["goal"] = section(text, "目标")
+        info["todo"] = {
+            "done": len(re.findall(r"^- \[[xX]\]", todo, re.M)),
+            "total": len(re.findall(r"^- \[[ xX]\]", todo, re.M)),
+        }
+        info["resumeText"] = section(text, "接续指引")
+    return info
+
+
+def store_info(local):
+    real = os.path.realpath(local)
+    return {"root": real, "id": hashlib.sha256(real.encode("utf-8")).hexdigest()[:12]}
+
+
+def tasks_json(local, with_archived="0"):
+    """`task list --json`：未归档任务（with_archived=1 时含已归档），坏文件进 errors 不中断。"""
+    tasks, errors = [], []
+    dirs = [os.path.join(local, "tasks")]
+    if with_archived == "1":
+        dirs.append(os.path.join(local, "tasks", "archived"))
+    for base in dirs:
+        if not os.path.isdir(base):
+            continue
+        for name in sorted(os.listdir(base)):
+            if name == "archived":
+                continue
+            path = os.path.join(base, name, "README.md")
+            if not os.path.isfile(path):
+                continue
+            try:
+                tasks.append(task_info(local, path))
+            except (OSError, UnicodeDecodeError) as exc:
+                errors.append({"slug": name, "error": str(exc)})
+    archived_dir = os.path.join(local, "tasks", "archived")
+    archived = len([n for n in os.listdir(archived_dir) if os.path.isdir(os.path.join(archived_dir, n))]) if os.path.isdir(archived_dir) else 0
+    return json.dumps({"v": 1, "store": store_info(local), "tasks": tasks, "archivedCount": archived, "errors": errors}, ensure_ascii=False)
+
+
+def task_json(local, path):
+    return json.dumps({"v": 1, "store": store_info(local), "task": task_info(local, path, detail=True)}, ensure_ascii=False)
+
+
 def render(template, dest, *pairs):
     """把模板中的 {{KEY}} 替换为值后写到 dest。pairs 形如 KEY=VALUE。"""
     text = read(template)
@@ -132,6 +224,8 @@ COMMANDS = {
     "fm-get": fm_get,
     "fm-set": fm_set,
     "section-field": section_field,
+    "tasks-json": tasks_json,
+    "task-json": task_json,
     "render": render,
     "set-memory-dir": set_memory_dir,
     "realpath": os.path.realpath,

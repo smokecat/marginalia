@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""trine 扩展：把项目 .local/ 里的 marginalia 任务交给 trine 显示（契约见 trine 的 docs/EXTENSIONS.md）。
+
+trine 以 `trine-ext <op>` 调用，stdin 一个 JSON，stdout 回一个 JSON；工作目录是会话目录。
+数据一律经同仓库的 `marginalia task ... --json` 取，不解析表格输出，也不直接改文件。
+Python 3.8+，只用标准库。
+"""
+
+import json
+import os
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+MARGINALIA = os.path.join(os.environ.get("TRINE_EXT_DIR") or os.path.dirname(HERE), "..", "..", "bin", "marginalia")
+
+STATUS = {
+    "active": ("进行中", "info"),
+    "paused": ("暂停", "warning"),
+    "blocked": ("阻塞", "danger"),
+    "done": ("完成", "success"),
+}
+ARCHIVED_SHOWN = 20
+
+
+class NoStore(Exception):
+    pass
+
+
+def marginalia(*args):
+    proc = subprocess.run(
+        ["bash", MARGINALIA] + list(args),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+        timeout=20,
+    )
+    if proc.returncode != 0:
+        err = proc.stderr.strip()
+        if "不在 git 项目中" in err or "没有 .local" in err:
+            raise NoStore(err)
+        raise RuntimeError(err or "marginalia 退出码 %d" % proc.returncode)
+    return proc.stdout
+
+
+def load_tasks():
+    data = json.loads(marginalia("task", "list", "--json", "--archived"))
+    active = [t for t in data["tasks"] if not t["archived"]]
+    archived = sorted((t for t in data["tasks"] if t["archived"]), key=lambda t: t.get("archivedAt") or t["updated"], reverse=True)
+    return data, active, archived
+
+
+def badges(task):
+    if task["archived"]:
+        return [{"text": "已归档", "tone": "neutral"}]
+    label, tone = STATUS.get(task["status"], (task["status"] or "?", "neutral"))
+    return [{"text": label, "tone": tone}]
+
+
+def ref(task):
+    return {"ref": task["slug"], "label": task["title"][:120]}
+
+
+def resume_prompt(task):
+    return "继续 %s 任务" % task["slug"]
+
+
+def detail(task):
+    r = task["resume"]
+    lines = ["**接续指引**", ""]
+    for key, label in (("state", "当前状态"), ("blocker", "卡点"), ("next", "下一步"), ("files", "关键文件")):
+        if r.get(key):
+            lines.append("- %s：%s" % (label, r[key]))
+    if task.get("result"):
+        lines.append("- 结果：%s" % task["result"])
+    lines.append("")
+    lines.append("`%s`" % task["path"])
+    return "\n".join(lines)
+
+
+def item(task, ctx, in_session):
+    slug = task["slug"]
+    actions = []
+    if not task["archived"]:
+        actions.append({
+            "id": "resume-new",
+            "label": "新会话接续",
+            "primary": True,
+            "effects": [{"type": "session.create", "prompt": resume_prompt(task), "title": task["title"][:200], "links": [ref(task)]}],
+        })
+        if in_session:
+            actions.append({"id": "resume-here", "label": "接续到本会话", "effects": [{"type": "prompt.send", "text": resume_prompt(task)}]})
+    if in_session:
+        actions.append({"id": "insert", "label": "插入引用", "effects": [{"type": "prompt.insert", "text": task["path"]}]})
+    if not task["archived"]:
+        if task["status"] != "done":
+            actions.append({"id": "status", "label": "标为完成", "invoke": {"params": {"slug": slug, "status": "done"}}})
+        else:
+            actions.append({"id": "status", "label": "重新打开", "invoke": {"params": {"slug": slug, "status": "active"}}})
+            actions.append({"id": "archive", "label": "归档", "destructive": True, "invoke": {"params": {"slug": slug}}})
+    sessions = [s["id"] for s in ctx.get("linkedSessions", []) if any(l.get("ref") == slug for l in s.get("links", []))]
+    next_step = task["resume"].get("next") or task["resume"].get("state") or ""
+    out = {
+        "id": slug,
+        "title": task["title"][:300],
+        "badges": badges(task),
+        "meta": "更新于 %s" % task["updated"] if task["updated"] else slug,
+        "detail": detail(task)[:16000],
+        "link": ref(task),
+        "actions": actions[:8],
+    }
+    if next_step:
+        out["subtitle"] = next_step[:500]
+    if sessions:
+        out["sessions"] = sessions[:20]
+    return out
+
+
+def linked_refs(ctx):
+    return set(l["ref"] for l in (ctx.get("session") or {}).get("links", []))
+
+
+def op_view(inp):
+    ctx = inp["context"]
+    in_session = ctx.get("session") is not None
+    _, active, archived = load_tasks()
+    linked = linked_refs(ctx)
+    groups = [
+        ("linked", "已关联", [t for t in active + archived if t["slug"] in linked], False),
+        ("active", "进行中", [t for t in active if t["status"] == "active" and t["slug"] not in linked], False),
+        ("waiting", "暂停 / 阻塞", [t for t in active if t["status"] in ("paused", "blocked") and t["slug"] not in linked], False),
+        ("done", "已完成", [t for t in active if t["status"] == "done" and t["slug"] not in linked], False),
+        ("archived", "已归档（最近 %d 个）" % ARCHIVED_SHOWN, [t for t in archived if t["slug"] not in linked][:ARCHIVED_SHOWN], True),
+    ]
+    sections = []
+    for sid, title, tasks, collapsed in groups:
+        if sid != "linked" and not tasks:
+            continue
+        if sid == "linked" and not in_session:
+            continue
+        section = {"id": sid, "title": title, "items": [item(t, ctx, in_session) for t in tasks][:200]}
+        if collapsed:
+            section["collapsed"] = True
+        if sid == "linked":
+            section["empty"] = "还没有关联任务。点任务右侧的关联按钮，或从会话菜单「关联…」。"
+        sections.append(section)
+    return {"view": {"sections": sections, "empty": "这个项目还没有任务。"}}
+
+
+def op_badge(inp):
+    ctx = inp["context"]
+    linked = linked_refs(ctx)
+    if not linked:
+        return {"badge": None}
+    _, active, archived = load_tasks()
+    tasks = [t for t in active + archived if t["slug"] in linked]
+    if not tasks:
+        return {"badge": None}
+    first = tasks[0]
+    badge = dict(badges(first)[0])
+    if len(tasks) > 1:
+        badge["text"] = "%s +%d" % (badge["text"], len(tasks) - 1)
+    badge["title"] = "、".join("%s（%s）" % (t["title"], badges(t)[0]["text"]) for t in tasks)[:300]
+    return {"badge": badge, "links": [ref(t) for t in tasks]}
+
+
+def op_pick(inp):
+    point = inp.get("point")
+    query = ((inp.get("args") or {}).get("query") or "").strip().lower()
+    _, active, archived = load_tasks()
+    tasks = active if point == "composerAction" else active + archived
+    if query:
+        tasks = [t for t in tasks if query in t["slug"].lower() or query in t["title"].lower()]
+    items = []
+    for t in tasks[:500]:
+        entry = {"id": t["slug"], "title": t["title"][:300], "badges": badges(t), "link": ref(t)}
+        if t["resume"].get("next"):
+            entry["subtitle"] = t["resume"]["next"][:500]
+        if point == "composerAction":
+            entry["effects"] = [{"type": "prompt.insert", "text": t["path"]}, {"type": "links.add", "links": [ref(t)]}]
+        items.append(entry)
+    return {"items": items}
+
+
+def op_action(inp):
+    args = inp.get("args") or {}
+    params = args.get("params") or {}
+    slug = params.get("slug", "")
+    if args.get("actionId") == "status":
+        marginalia("task", "status", slug, params.get("status", ""))
+        return {"ok": True, "message": "%s：%s" % (slug, STATUS.get(params.get("status"), ("已更新",))[0])}
+    if args.get("actionId") == "archive":
+        marginalia("task", "archive", slug)
+        return {"ok": True, "message": "已归档 %s" % slug}
+    return {"error": {"code": "unknown_action", "message": "不认识的操作"}}
+
+
+OPS = {"view": op_view, "badge": op_badge, "pick": op_pick, "action": op_action}
+
+
+def main():
+    op = sys.argv[1] if len(sys.argv) > 1 else ""
+    try:
+        inp = json.load(sys.stdin)
+    except ValueError:
+        inp = {}
+    if op not in OPS:
+        out = {"error": {"code": "unsupported", "message": "不支持的操作：%s" % op}}
+    else:
+        try:
+            out = OPS[op](inp)
+        except NoStore:
+            out = {"view": {"sections": [], "empty": "这个工作区还没有启用 marginalia（没有 .local/）。"}} if op == "view" else (
+                {"badge": None} if op == "badge" else {"items": []} if op == "pick" else {"error": {"code": "no_store", "message": "这个工作区没有 .local/"}})
+        except Exception as exc:  # noqa: BLE001  扩展出错要以契约格式回给 trine
+            out = {"error": {"code": "marginalia_error", "message": str(exc)[:500]}}
+    json.dump(out, sys.stdout, ensure_ascii=False)
+
+
+if __name__ == "__main__":
+    main()

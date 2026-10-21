@@ -244,6 +244,129 @@ lacks() { [[ "$output" != *"$1"* ]] || { echo "输出中不应有：$1"; echo "$
   [ "$status" -eq 0 ]
 }
 
+@test "task：status / archive 也拒绝非法 slug（不能逃出 tasks 目录）" {
+  init_repo "$P"
+  mg init "$P"
+  cd "$P"
+  mkdir -p "$P/.local/x" && printf -- '---\nstatus: active\n---\n# x\n' > "$P/.local/x/README.md"
+  run mg task status ../x done
+  [ "$status" -ne 0 ]
+  has "kebab-case"
+  grep -qx "status: active" "$P/.local/x/README.md"
+  run mg task archive ../x --force
+  [ "$status" -ne 0 ]
+  has "kebab-case"
+}
+
+@test "task：commit 只包含本次操作的路径，用户另外暂存的改动保持暂存" {
+  init_repo "$P"
+  mg init "$P"
+  cd "$P"
+  echo note >> "$P/.local/todo.md"
+  git -C "$P/.local" add todo.md
+  mg task new keep-staged
+  [ "$(git -C "$P/.local" diff --cached --name-only)" = "todo.md" ]
+  ! git -C "$P/.local" show --name-only --format= HEAD | grep -q todo.md
+}
+
+@test "task：重复归档已归档的任务不报错" {
+  init_repo "$P"
+  mg init "$P"
+  cd "$P"
+  mg task new twice
+  mg task archive twice --force
+  run mg task archive twice --force
+  [ "$status" -eq 0 ]
+  has "已归档"
+}
+
+@test "task list --json / task show --json：机器可读，含接续指引与任务库身份" {
+  init_repo "$P"
+  mg init "$P"
+  cd "$P"
+  mg task new alpha 'Alpha 任务'
+  mg task new beta
+  sed 's/^- \*\*下一步\*\*：.*$/- **下一步**：跑测试/' "$P/.local/tasks/alpha/README.md" > x && mv x "$P/.local/tasks/alpha/README.md"
+  mg task status beta done
+  mg task archive beta
+  run mg task list --json
+  [ "$status" -eq 0 ]
+  python3 - "$output" <<'PY'
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["v"] == 1 and len(d["store"]["id"]) == 12, d
+assert [t["slug"] for t in d["tasks"]] == ["alpha"], d
+t = d["tasks"][0]
+assert t["title"] == "Alpha 任务" and t["status"] == "active" and t["archived"] is False
+assert t["resume"]["next"] == "跑测试" and t["resume"]["state"] == "", t
+assert t["path"] == ".local/tasks/alpha/README.md"
+assert d["archivedCount"] == 1
+PY
+  run mg task list --json --archived
+  python3 -c 'import json,sys; d=json.loads(sys.argv[1]); a=[t for t in d["tasks"] if t["archived"]]; assert [t["slug"] for t in a]==["beta"] and a[0]["path"]==".local/tasks/archived/beta/README.md"' "$output"
+  run mg task show beta --json
+  [ "$status" -eq 0 ]
+  python3 -c 'import json,sys; t=json.loads(sys.argv[1])["task"]; assert t["archived"] and "todo" in t and "goal" in t' "$output"
+  run mg task show ../etc --json
+  [ "$status" -ne 0 ]
+}
+
+# ------------------------------------------------------------------ trine 扩展
+
+ext() { # <op> <json>
+  printf '%s' "$2" | TRINE_EXT_DIR="$REPO/integrations/trine" python3 "$REPO/integrations/trine/bin/trine-ext" "$1"
+}
+
+@test "trine 扩展：没有 .local 时返回空视图而不是报错" {
+  init_repo "$P"
+  cd "$P"
+  run ext view '{"op":"view","point":"sessionPanel","context":{"cwd":"x","linkedSessions":[]}}'
+  [ "$status" -eq 0 ]
+  has "没有启用 marginalia"
+}
+
+@test "trine 扩展：视图按关联 / 状态分组，动作与契约一致" {
+  init_repo "$P"
+  mg init "$P"
+  cd "$P"
+  mg task new alpha 'Alpha 任务'
+  mg task new beta
+  mg task status beta paused
+  run ext view '{"op":"view","point":"sessionPanel","context":{"cwd":"x","session":{"id":"s1","links":[{"ref":"beta","label":"b"}]},"linkedSessions":[{"id":"s1","links":[{"ref":"beta","label":"b"}]}]}}'
+  [ "$status" -eq 0 ]
+  python3 - "$output" <<'PY'
+import json, sys
+v = json.loads(sys.argv[1])["view"]
+secs = {s["id"]: s for s in v["sections"]}
+assert [i["id"] for i in secs["linked"]["items"]] == ["beta"], secs
+assert secs["linked"]["items"][0]["sessions"] == ["s1"]
+alpha = secs["active"]["items"][0]
+ids = [a["id"] for a in alpha["actions"]]
+assert ids[:3] == ["resume-new", "resume-here", "insert"], ids
+new = alpha["actions"][0]["effects"][0]
+assert new["type"] == "session.create" and new["prompt"] == "继续 alpha 任务" and new["links"] == [{"ref": "alpha", "label": "Alpha 任务"}]
+assert alpha["link"]["ref"] == "alpha"
+PY
+}
+
+@test "trine 扩展：badge、pick（含输入框入口）与 action" {
+  init_repo "$P"
+  mg init "$P"
+  cd "$P"
+  mg task new alpha 'Alpha 任务'
+  run ext badge '{"op":"badge","context":{"session":{"id":"s","links":[{"ref":"alpha","label":"old"}]}}}'
+  python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["badge"]["text"]=="进行中" and d["links"]==[{"ref":"alpha","label":"Alpha 任务"}], d' "$output"
+  run ext pick '{"op":"pick","point":"composerAction","context":{},"args":{"query":"alp"}}'
+  python3 -c 'import json,sys; i=json.loads(sys.argv[1])["items"]; assert [e["type"] for e in i[0]["effects"]]==["prompt.insert","links.add"], i' "$output"
+  run ext action '{"op":"action","context":{},"args":{"actionId":"status","params":{"slug":"alpha","status":"done"}}}'
+  [ "$status" -eq 0 ]
+  grep -qx "status: done" "$P/.local/tasks/alpha/README.md"
+  run ext action '{"op":"action","context":{},"args":{"actionId":"archive","params":{"slug":"alpha"}}}'
+  [ -d "$P/.local/tasks/archived/alpha" ]
+  run ext action '{"op":"action","context":{},"args":{"actionId":"archive","params":{"slug":"alpha"}}}'
+  has '"ok": true'
+}
+
 # ------------------------------------------------------------------ setup / uninstall
 
 @test "setup：建立软链，只为已安装的工具写全局入口，幂等" {

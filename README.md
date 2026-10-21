@@ -83,7 +83,8 @@ marginalia init
 marginalia setup | uninstall
 marginalia init [--git-init] [--update-spec] [--create-claude-md] [--migrate-memory] [目录]
 marginalia task new <slug> [标题]
-marginalia task list
+marginalia task list [--json] [--archived]
+marginalia task show <slug> --json
 marginalia task status <slug> <active|paused|blocked|done>
 marginalia task archive <slug> [一句话结果] [--force]
 marginalia --version
@@ -97,6 +98,20 @@ marginalia --version
 | `--migrate-memory` | 把 Claude 默认 auto memory 目录的内容复制进 `.local/memory/` |
 
 `init` 是幂等的：缺的补上，失效的修复，托管块外的内容和已有的用户数据一律不覆盖。
+
+`--json` 给其他程序用：`task list --json` 输出任务库身份（`store.root`、`store.id`）和每个任务的 slug、标题、状态、日期、是否归档、路径与接续指引四个字段；`task show <slug> --json` 另带目标、待办计数和接续指引全文。归档只移动目录，slug 不变，可以当作稳定的引用。
+
+写任务的命令只提交它自己改动的路径，你另外暂存在 `.local` 里的改动不会被一起提交。文件已改但 commit 失败（hook、签名等）时退出码为 4。
+
+## 在 trine 里使用
+
+[trine](https://github.com/smokecat/trine)（Claude Code 的自托管远程界面）可以加载 marginalia 的扩展：在会话页查看本项目的任务、把会话关联到任务、一键开新会话接续。扩展在 `integrations/trine/`，需要 trine agent 0.16.0 及以上，在 agent 所在的机器上注册：
+
+```sh
+trine-agent ext add <marginalia 目录>/integrations/trine
+```
+
+扩展通过同一份 marginalia 的 `--json` 读数据，「标为完成」「归档」也调用 marginalia 命令，不直接改文件。它看不到对话内容，只拿到会话的目录和关联。权限（直接发送、新建会话要不要确认）在 trine 的「设置 → 扩展」里设置。
 
 ## 推荐的项目指令结构
 

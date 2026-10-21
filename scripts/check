@@ -14,7 +14,9 @@ tool() { # <命令名>：输出可执行的命令前缀
 
 lint() {
   $(tool shellcheck) bin/marginalia scripts/check
-  python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' lib/helpers.py
+  for f in lib/helpers.py integrations/trine/bin/trine-ext; do
+    python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$f"
+  done
   # bash 3.2 会把紧跟在 $var 后的非 ASCII 字节当成变量名的一部分，必须写成 ${var}
   python3 - bin/marginalia scripts/check <<'PY'
 import re, sys

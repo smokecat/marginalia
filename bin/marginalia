@@ -28,7 +28,8 @@ usage() {
       --create-claude-md                 项目只有 AGENTS.md 时创建 CLAUDE.md（内容 @AGENTS.md，共享文件）
       --migrate-memory                   把 Claude 默认 auto memory 复制进 .local/memory/
   marginalia task new <slug> [标题]      新建任务
-  marginalia task list                   列出未归档任务
+  marginalia task list [--json] [--archived]   列出未归档任务（--json 输出机器可读结果，--archived 含已归档）
+  marginalia task show <slug> --json     单个任务的详情（含接续指引），机器可读
   marginalia task status <slug> <状态>   active | paused | blocked | done
   marginalia task archive <slug> [结果] [--force]   归档（状态不是 done 时需 --force）
   marginalia --version
@@ -233,13 +234,19 @@ cmd_init() {
 
 # ---------------------------------------------------------------- task
 
-# 在 .local 仓库里只提交指定路径
+# 在 .local 仓库里只提交指定路径：用户另外暂存的改动不会被一起提交
+# 文件已改但 commit 失败（hook、签名等）时以退出码 4 报告，与「没改动」区分开
 lcommit() { # <.local> <message> <paths...>
   local L=$1 msg=$2 p
   shift 2
   for p in "$@"; do git -C "$L" add -A -- "$p" 2>/dev/null || true; done
-  git -C "$L" diff --cached --quiet && return 0
-  git -C "$L" commit -q -m "$msg" && say COMMITTED "$msg"
+  git -C "$L" diff --cached --quiet -- "$@" && return 0
+  if git -C "$L" commit -q -m "$msg" -- "$@"; then
+    say COMMITTED "$msg"
+  else
+    printf 'marginalia: 文件已修改，但 .local 的 commit 失败：%s\n' "$msg" >&2
+    exit 4
+  fi
 }
 
 find_local() {
@@ -252,6 +259,16 @@ find_local() {
 
 valid_slug() {
   printf '%s' "$1" | grep -qE '^[a-z0-9]+(-[a-z0-9]+)*$' || die "slug 需为 kebab-case：$1"
+}
+
+# 是否带 --json（从参数里拿掉后放回 ARGS）
+JSON=0
+take_json() {
+  ARGS=()
+  local a
+  for a in "$@"; do
+    if [ "$a" = --json ]; then JSON=1; else ARGS+=("$a"); fi
+  done
 }
 
 cmd_task() {
@@ -273,7 +290,18 @@ cmd_task() {
       lcommit "$L" "task($slug): create" "tasks/$slug"
       ;;
     list)
-      local f n=0 archived=0 slug
+      local f n=0 archived=0 slug with_archived=0 a
+      for a in "$@"; do
+        case $a in
+          --json) JSON=1 ;;
+          --archived) with_archived=1 ;;
+          *) die "未知参数：$a" ;;
+        esac
+      done
+      if [ $JSON = 1 ]; then
+        helper tasks-json "$L" "$with_archived"
+        return
+      fi
       printf '%-28s %-8s %-11s %s\n' TASK STATUS UPDATED 当前状态
       for f in "$L"/tasks/*/README.md; do
         [ -e "$f" ] || continue
@@ -287,9 +315,21 @@ cmd_task() {
       for f in "$L"/tasks/archived/*/; do [ -d "$f" ] && archived=$((archived + 1)); done
       echo "已归档：$archived 个"
       ;;
+    show)
+      take_json "$@"
+      [ ${#ARGS[@]} -eq 1 ] || die "用法：marginalia task show <slug> --json"
+      [ $JSON = 1 ] || die "task show 目前只支持 --json"
+      local slug=${ARGS[0]} f
+      valid_slug "$slug"
+      f="$L/tasks/$slug/README.md"
+      [ -f "$f" ] || f="$L/tasks/archived/$slug/README.md"
+      [ -f "$f" ] || die "没有任务：$slug"
+      helper task-json "$L" "$f"
+      ;;
     status)
       [ $# -ge 2 ] || die "用法：marginalia task status <slug> <$STATUSES>"
       local slug=$1 st=$2 f
+      valid_slug "$slug"
       f="$L/tasks/$slug/README.md"
       [ -f "$f" ] || die "没有任务：$slug"
       case " $STATUSES " in *" $st "*) ;; *) die "状态须为：$STATUSES" ;; esac
@@ -306,7 +346,12 @@ cmd_task() {
         esac
       done
       [ -n "$slug" ] || die "需要 slug"
+      valid_slug "$slug"
       f="$L/tasks/$slug/README.md"
+      if [ ! -f "$f" ] && [ -f "$L/tasks/archived/$slug/README.md" ]; then
+        say SKIPPED "tasks/archived/$slug 已归档"
+        return
+      fi
       [ -f "$f" ] || die "没有任务：$slug"
       st=$(helper fm-get "$f" status)
       [ "$st" = "done" ] || [ $force = 1 ] || die "任务状态是 $st 不是 done；确认要归档的话加 --force"

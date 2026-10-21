@@ -14,3 +14,11 @@
 - 项目没有 `CLAUDE.md` 时在 `CLAUDE.local.md` 托管块内 `@AGENTS.md` 兜底。
 - worktree 自动共享主工作区的 `.local`。
 - bats 测试套件与 `scripts/check`，CI 覆盖 Linux 和 macOS（bash 3.2）。
+- `marginalia task list --json [--archived]`、`marginalia task show <slug> --json`：机器可读的任务列表与详情（含接续指引、任务库身份）。
+- trine 扩展（`integrations/trine/`）：在 trine 的会话页查看任务、关联会话、一键接续。
+
+### 修复
+
+- `task status` / `task archive` 没有校验 slug，`../x` 这样的参数能操作 `tasks/` 之外的文件。
+- 写任务的命令会把用户另外暂存在 `.local` 里的改动一起提交；现在只提交本次操作的路径，commit 失败时退出码为 4。
+- 重复归档已归档的任务不再报错。
