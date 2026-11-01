@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 
 START, END = "<!-- marginalia:start -->", "<!-- marginalia:end -->"
@@ -155,9 +156,22 @@ def task_info(local, path, detail=False):
     return info
 
 
+def store_id(local):
+    """任务库身份：工作区 git config 里的 marginalia.storeId（init 时写入，改目录名后不变）；没有时由路径算出。"""
+    if os.path.isdir(os.path.join(local, ".git")):
+        try:
+            out = subprocess.run(["git", "-C", local, "config", "--local", "--get", "marginalia.storeId"],
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True)
+            if out.returncode == 0 and out.stdout.strip():
+                return out.stdout.strip()
+        except OSError:
+            pass
+    return hashlib.sha256(os.path.realpath(local).encode("utf-8")).hexdigest()[:12]
+
+
 def store_info(local):
-    real = os.path.realpath(local)
-    return {"root": real, "id": hashlib.sha256(real.encode("utf-8")).hexdigest()[:12]}
+    # project：任务 path 相对的项目根（worktree 里是该 worktree 的根）；dir：工作区目录名
+    return {"root": os.path.realpath(local), "id": store_id(local), "dir": os.path.basename(local), "project": os.path.dirname(local)}
 
 
 def tasks_json(local, with_archived="0"):
@@ -192,17 +206,26 @@ def task_json(local, path):
 
 
 def render(template, dest, *pairs):
-    """把模板中的 {{KEY}} 替换为值后写到 dest。pairs 形如 KEY=VALUE。"""
+    """把模板中的 {{KEY}} 替换为值后写到 dest（dest 为 - 时输出到 stdout）。pairs 形如 KEY=VALUE。"""
     text = read(template)
     for pair in pairs:
         key, _, value = pair.partition("=")
         text = text.replace("{{%s}}" % key, value)
+    if dest == "-":
+        return text.rstrip("\n")
     write(dest, text)
     return ""
 
 
-def set_memory_dir(path, want):
-    """在 settings.local.json 中设置 autoMemoryDirectory，保留其他字段。"""
+LEGACY_DIR = ".local"
+
+
+def set_memory_dir(path, want, previous=""):
+    """在 settings.local.json 中设置 autoMemoryDirectory，保留其他字段。
+
+    已有值属于 marginalia（可以覆盖）的情况：等于 previous（改目录名前的路径），
+    或以 /<同名目录>/memory、/.local/memory 结尾（项目搬了位置、旧版目录名）。其他值视为用户自己的设置。
+    """
     data = {}
     if os.path.exists(path):
         try:
@@ -214,11 +237,53 @@ def set_memory_dir(path, want):
     cur = data.get("autoMemoryDirectory")
     if cur == want:
         return "SKIPPED"
-    if cur and not cur.rstrip("/").endswith("/.local/memory"):
+    ours = [previous] if previous else []
+    names = {os.path.basename(os.path.dirname(want)), LEGACY_DIR}
+    if cur and cur not in ours and not any(cur.rstrip("/").endswith("/%s/memory" % n) for n in names):
         return "CONFLICT 已指向 %s，未修改" % cur
     data["autoMemoryDirectory"] = want
     write(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
     return "FIXED 路径已更新" if cur else "CREATED"
+
+
+def exclude_rename(path, old, new):
+    """.git/info/exclude 中把整行等于 old 的规则换成 new（new 已存在则只删 old）。打印 UPDATED / SKIPPED。"""
+    if not os.path.exists(path):
+        return "SKIPPED"
+    lines = read(path).split("\n")
+    if old not in lines:
+        return "SKIPPED"
+    out, placed = [], new in lines
+    for line in lines:
+        if line == old:
+            if not placed:
+                out.append(new)
+                placed = True
+            continue
+        out.append(line)
+    write(path, "\n".join(out))
+    return "UPDATED"
+
+
+SKIP_DIRS = {".git", "tmp", "logs", "out"}
+
+
+def find_refs(local, name):
+    """工作区里正文提到 <name>/ 的文本文件（相对路径，每行一个）。家目录下的同名目录（~/.local/ 等）不算。"""
+    pat = re.compile(r"(?<![\w.-])%s/" % re.escape(name))
+    homes = ("~/", "$HOME/", "${HOME}/", os.path.expanduser("~").rstrip("/") + "/")
+    hits = []
+    for base, dirs, files in os.walk(local):
+        dirs[:] = sorted(d for d in dirs if d != ".git" and not (base == local and d in SKIP_DIRS))
+        for f in sorted(files):
+            p = os.path.join(base, f)
+            try:
+                text = read(p)
+            except (OSError, UnicodeDecodeError):
+                continue
+            if any(not text[:m.start()].endswith(homes) for m in pat.finditer(text)):
+                hits.append(os.path.relpath(p, local))
+    return "\n".join(hits)
 
 
 COMMANDS = {
@@ -231,6 +296,9 @@ COMMANDS = {
     "task-json": task_json,
     "render": render,
     "set-memory-dir": set_memory_dir,
+    "store-id": store_id,
+    "exclude-rename": exclude_rename,
+    "find-refs": find_refs,
     "realpath": os.path.realpath,
 }
 

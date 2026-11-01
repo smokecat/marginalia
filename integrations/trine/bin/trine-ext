@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""trine 扩展：把项目 .local/ 里的 marginalia 任务交给 trine 显示（契约见 trine 的 docs/EXTENSIONS.md）。
+"""trine 扩展：把项目私有工作区（默认 .margin/）里的 marginalia 任务交给 trine 显示（契约见 trine 的 docs/EXTENSIONS.md）。
 
 trine 以 `trine-ext <op>` 调用，stdin 一个 JSON，stdout 回一个 JSON；工作目录是会话目录。
 数据一律经同仓库的 `marginalia task ... --json` 取，不解析表格输出，也不直接改文件。
@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 
+NO_STORE_EXIT = 5  # marginalia：不在 git 项目中 / 项目没有私有工作区
 HERE = os.path.dirname(os.path.realpath(__file__))
 MARGINALIA = os.path.join(os.environ.get("TRINE_EXT_DIR") or os.path.dirname(HERE), "..", "..", "bin", "marginalia")
 
@@ -43,7 +44,7 @@ def marginalia(*args):
     )
     if proc.returncode != 0:
         err = proc.stderr.strip()
-        if "不在 git 项目中" in err or "没有 .local" in err:
+        if proc.returncode == NO_STORE_EXIT:
             raise NoStore(err)
         raise RuntimeError(err or "marginalia 退出码 %d" % proc.returncode)
     return proc.stdout
@@ -54,19 +55,20 @@ def load_tasks():
     store = data["store"]["id"]
     for t in data["tasks"]:
         t["store"] = store
+        t["project"] = data["store"].get("project")
     active = [t for t in data["tasks"] if not t["archived"]]
     archived = sorted((t for t in data["tasks"] if t["archived"]), key=lambda t: t.get("archivedAt") or t["updated"], reverse=True)
     return data, active, archived
 
 
 def project_root(cwd):
-    """会话所在 git 工作树的根（worktree 里也是该 worktree 的根，.local 是指向主工作区的软链）。"""
+    """会话所在 git 工作树的根；marginalia 的输出里没有 project 时才用到。"""
     try:
         out = subprocess.run(["git", "-C", cwd, "rev-parse", "--show-toplevel"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                              universal_newlines=True, timeout=5)
         top = out.stdout.strip()
         if out.returncode == 0 and top:
-            return os.path.dirname(top) if os.path.basename(top) == ".local" else top
+            return top
     except (OSError, subprocess.SubprocessError):
         pass
     return cwd
@@ -75,7 +77,7 @@ def project_root(cwd):
 def rel_path(task, ctx):
     """任务 README 相对会话目录的路径（会话可能开在项目的子目录里）。"""
     cwd = ctx.get("cwd") or os.getcwd()
-    return os.path.relpath(os.path.join(project_root(cwd), task["path"]), cwd)
+    return os.path.relpath(os.path.join(task.get("project") or project_root(cwd), task["path"]), cwd)
 
 
 def badges(task):
@@ -278,8 +280,8 @@ def main():
         try:
             out = OPS[op](inp)
         except NoStore:
-            out = {"view": {"sections": [], "empty": "这个工作区还没有启用 marginalia（没有 .local/）。"}} if op == "view" else (
-                {"badge": None} if op == "badge" else {"items": []} if op == "pick" else {"error": {"code": "no_store", "message": "这个工作区没有 .local/"}})
+            out = {"view": {"sections": [], "empty": "这个工作区还没有启用 marginalia（没有私有工作区）。"}} if op == "view" else (
+                {"badge": None} if op == "badge" else {"items": []} if op == "pick" else {"error": {"code": "no_store", "message": "这个工作区没有 marginalia 私有工作区"}})
         except Exception as exc:  # noqa: BLE001  扩展出错要以契约格式回给 trine
             out = {"error": {"code": "marginalia_error", "message": str(exc)[:500]}}
     json.dump(out, sys.stdout, ensure_ascii=False)

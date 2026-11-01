@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# marginalia — 项目私有工作区（.local/）的确定性操作。任何 agent 工具或人都可直接调用。
+# marginalia — 项目私有工作区（默认 .margin/，目录名可配置）的确定性操作。任何 agent 工具或人都可直接调用。
 # 依赖：bash ≥ 3.2、git ≥ 2.31、python3 ≥ 3.8
 set -euo pipefail
 
@@ -9,24 +9,37 @@ TPL="$MARGINALIA_HOME/templates"
 VERSION=$(cat "$MARGINALIA_HOME/VERSION")
 TODAY=$(date +%F)
 STATUSES="active paused blocked done"
+PREV_DIR=""  # migrate 刚把工作区从这个名字改走（init 据此自动更新未改动过的规范文件）
 SKILL_DIRS="$HOME/.agents/skills ${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills"
 BIN_DIR="$HOME/.local/bin"
 GLOBAL_ENTRIES="${CODEX_HOME:-$HOME/.codex}/AGENTS.md $HOME/.gemini/GEMINI.md"
+BUILTIN_DIR=.margin
+LEGACY_DIR=.local
+SYSTEM_CONFIG=${MARGINALIA_SYSTEM_CONFIG:-/etc/marginalia/config}
+USER_CONFIG=${MARGINALIA_USER_CONFIG:-$HOME/.marginalia/config}
 
 say() { printf '[%s] %s\n' "$1" "$2"; }
 die() { printf 'marginalia: %s\n' "$*" >&2; exit 1; }
+# 没有可用的工作区（不在 git 项目中 / 项目没有初始化）：退出码 5，供其他程序区分
+die_nostore() { printf 'marginalia: %s\n' "$*" >&2; exit 5; }
 helper() { python3 "$MARGINALIA_HOME/lib/helpers.py" "$@"; }
 
 usage() {
   cat <<'EOF'
 用法：
   marginalia setup                       本机安装：skills 软链、marginalia 命令、各 agent 全局入口
-  marginalia uninstall                   撤销 setup（不动任何项目里的 .local）
-  marginalia init [选项] [目录]          在项目落地/修复/升级 .local 私有工作区（幂等）
+  marginalia uninstall                   撤销 setup（不动任何项目里的私有工作区）
+  marginalia init [选项] [目录]          在项目落地/修复/升级私有工作区（幂等）
+      --dir <名字>                       本项目使用的目录名（默认见 marginalia config），写入项目配置
       --git-init                         目录不是 git 仓库时先 git init
-      --update-spec                      用最新模板覆盖 .local/README.md 与 .local/templates/task.md
+      --update-spec                      用最新模板覆盖工作区的 README.md 与 templates/task.md
       --create-claude-md                 项目只有 AGENTS.md 时创建 CLAUDE.md（内容 @AGENTS.md，共享文件）
-      --migrate-memory                   把 Claude 默认 auto memory 复制进 .local/memory/
+      --migrate-memory                   把 Claude 默认 auto memory 复制进工作区的 memory/
+  marginalia migrate [--to <名字>] [--dry-run] [目录]
+                                         把已有工作区改名（默认改为当前默认目录名，如旧版 .local → .margin）
+  marginalia config [--list]             各级配置与生效的目录名
+  marginalia config [级别] dir [名字]    读取/设置目录名；级别：--system | --user | --project
+  marginalia config <级别> --unset dir   删除该级别的设置
   marginalia task new <slug> [标题]      新建任务
   marginalia task list [--json] [--archived]   列出未归档任务（--json 输出机器可读结果，--archived 含已归档）
   marginalia task show <slug> --json     单个任务的详情（含接续指引），机器可读
@@ -34,8 +47,153 @@ usage() {
   marginalia task archive <slug> [结果] [--force]   归档（状态不是 done 时需 --force）
   marginalia --version
 
+目录名优先级（高 → 低）：项目（.git/config 的 marginalia.dir）> 环境变量 MARGINALIA_DIR
+> 用户（~/.marginalia/config）> 系统（/etc/marginalia/config）> 内置 .margin。
+init 会把实际使用的目录名写进项目配置，之后改默认值不影响已有项目。
+
 输出中的 [ASK] 表示需要用户决定，[CONFLICT] 表示未自动处理的冲突。
 EOF
+}
+
+# ---------------------------------------------------------------- 目录名与配置
+
+valid_dir() { # <名字>：工作区目录名只能是项目根下的一级名字
+  case $1 in
+    ''|.|..|.git|.claude|.agents|*/*) return 1 ;;
+  esac
+  printf '%s' "$1" | grep -qE '^[A-Za-z0-9._-]+$'
+}
+
+conf_get() { # <配置文件>：读 marginalia.dir，没有则输出空
+  [ -f "$1" ] || return 0
+  git config -f "$1" --get marginalia.dir 2>/dev/null || true
+}
+
+project_conf() { # <项目根>：主仓库 .git/config 里的 marginalia.dir（worktree 共用）
+  git -C "$1" config --local --get marginalia.dir 2>/dev/null || true
+}
+
+checked() { # <名字> <来源>：配置值不合法时报错并指出来源
+  valid_dir "$1" || die "目录名不合法：$1（来自 $2）"
+  printf '%s' "$1"
+}
+
+# 新项目使用的目录名（不含项目级）：环境变量 > 用户 > 系统 > 内置，结果在 D / D_SRC
+default_dir() {
+  local v
+  if [ -n "${MARGINALIA_DIR:-}" ]; then D=$(checked "$MARGINALIA_DIR" MARGINALIA_DIR); D_SRC="env"; return; fi
+  v=$(conf_get "$USER_CONFIG")
+  if [ -n "$v" ]; then D=$(checked "$v" "$USER_CONFIG"); D_SRC=user; return; fi
+  v=$(conf_get "$SYSTEM_CONFIG")
+  if [ -n "$v" ]; then D=$(checked "$v" "$SYSTEM_CONFIG"); D_SRC=system; return; fi
+  D=$BUILTIN_DIR; D_SRC=builtin
+}
+
+is_ws() { [ -d "$1/.git" ] && [ -d "$1/tasks" ]; }
+
+# 项目当前使用的目录名：项目配置 > 默认值（目录已存在时）> 旧版 .local（存在时）> 默认值
+# 环境变量只覆盖默认值、不覆盖项目配置：否则 shell 里的一个变量会让所有已有项目找不到工作区
+resolve_dir() { # <项目根>
+  local v
+  v=$(project_conf "$1")
+  if [ -n "$v" ]; then D=$(checked "$v" "项目配置 marginalia.dir"); D_SRC=project; return; fi
+  default_dir
+  if [ "$D" != "$LEGACY_DIR" ] && [ ! -e "$1/$D" ] && is_ws "$1/$LEGACY_DIR"; then D=$LEGACY_DIR; D_SRC=legacy; fi
+}
+
+pin_dir() { # <主工作区> <名字>
+  if [ "$(project_conf "$1")" = "$2" ]; then
+    say SKIPPED "项目配置 marginalia.dir = $2"
+  else
+    git -C "$1" config --local marginalia.dir "$2"; say CREATED "项目配置 marginalia.dir = $2（$1/.git/config）"
+  fi
+}
+
+# 任务库身份存进工作区自己的 git config，改目录名后保持不变（trine 的会话关联靠它）
+ensure_store_id() { # <工作区>
+  [ -d "$1/.git" ] || return 0
+  git -C "$1" config --local --get marginalia.storeId >/dev/null 2>&1 && return 0
+  git -C "$1" config --local marginalia.storeId "$(helper store-id "$1")"
+}
+
+cmd_config() {
+  local level="" unset=0 list=0 key="" value="" have_value=0 a root="" file
+  for a in "$@"; do
+    case $a in
+      --system|--user|--project) level=${a#--} ;;
+      --unset) unset=1 ;;
+      --list|-l) list=1 ;;
+      -*) die "未知选项 $a" ;;
+      *) if [ -z "$key" ]; then key=$a; else value=$a; have_value=1; fi ;;
+    esac
+  done
+  [ -z "$key" ] || [ "$key" = dir ] || die "未知配置项：${key}（目前只有 dir）"
+  root=$(git rev-parse --show-toplevel 2>/dev/null || true)
+  if [ -n "$root" ]; then root=$(main_root "$root"); fi
+
+  if [ -z "$key" ] || [ $list = 1 ]; then
+    [ $unset = 0 ] && [ $have_value = 0 ] || die "用法：marginalia config <级别> [--unset] dir [名字]"
+    row() { printf '%-8s %-44s %s\n' "$1" "$2" "${3:-（未设置）}"; }
+    row system "$SYSTEM_CONFIG" "$(conf_get "$SYSTEM_CONFIG")"
+    row user "$USER_CONFIG" "$(conf_get "$USER_CONFIG")"
+    row env MARGINALIA_DIR "${MARGINALIA_DIR:-}"
+    if [ -n "$root" ]; then
+      row project "$root/.git/config" "$(project_conf "$root")"
+      resolve_dir "$root"; echo "本项目：${D}（${D_SRC}）"
+    else
+      row project "（不在 git 项目中）" ""
+    fi
+    default_dir; echo "新项目默认：${D}（${D_SRC}）"
+    return
+  fi
+
+  if [ -z "$level" ]; then
+    [ $unset = 0 ] && [ $have_value = 0 ] || die "设置或删除时需要指定级别：--system | --user | --project"
+    if [ -n "$root" ]; then resolve_dir "$root"; else default_dir; fi
+    echo "$D"; return
+  fi
+
+  if [ $have_value = 0 ] && [ $unset = 0 ]; then
+    case $level in
+      system) conf_get "$SYSTEM_CONFIG" ;;
+      user) conf_get "$USER_CONFIG" ;;
+      project) [ -n "$root" ] || die "不在 git 项目中"; project_conf "$root" ;;
+    esac
+    echo; return
+  fi
+  [ $unset = 0 ] || [ $have_value = 0 ] || die "--unset 不需要名字"
+  [ $unset = 1 ] || valid_dir "$value" || die "目录名不合法：${value}（只能是项目根下的一级名字，不能是 .git 等）"
+
+  if [ "$level" = project ]; then
+    [ -n "$root" ] || die "不在 git 项目中"
+    # 已有工作区时改项目配置等于让项目找不到它，改名走 migrate
+    resolve_dir "$root"
+    local cur=$D want
+    if [ $unset = 1 ]; then default_dir; want=$D; else want=$value; fi
+    if [ "$cur" != "$want" ] && is_ws "$root/$cur"; then
+      die "项目已有工作区 $cur/，改名请用 marginalia migrate --to $want"
+    fi
+    if [ $unset = 1 ]; then
+      git -C "$root" config --local --unset marginalia.dir || true; say REMOVED "项目配置 marginalia.dir"
+    else
+      git -C "$root" config --local marginalia.dir "$value"; say UPDATED "项目配置 marginalia.dir = $value"
+    fi
+    return
+  fi
+  if [ "$level" = system ]; then file=$SYSTEM_CONFIG; else file=$USER_CONFIG; fi
+  if [ $unset = 1 ]; then
+    [ -f "$file" ] && git config -f "$file" --unset marginalia.dir || true
+    say REMOVED "$file marginalia.dir"
+  else
+    mkdir -p "$(dirname "$file")" 2>/dev/null || die "无法创建 $(dirname "$file")（系统级配置可能需要 sudo）"
+    git config -f "$file" marginalia.dir "$value" || die "无法写入 ${file}（系统级配置可能需要 sudo）"
+    say UPDATED "$file marginalia.dir = $value"
+  fi
+  say INFO "只影响之后新初始化的项目；Codex / Gemini 的全局入口按默认目录名生成，重跑 marginalia setup 更新"
+}
+
+main_root() { # <工作树根>：主工作区根（worktree 时不同）
+  dirname "$(git -C "$1" rev-parse --path-format=absolute --git-common-dir)"
 }
 
 # ---------------------------------------------------------------- setup / uninstall
@@ -66,9 +224,10 @@ cmd_setup() {
   link "$SELF" "$BIN_DIR/marginalia"
   case ":$PATH:" in *":$BIN_DIR:"*) ;; *) say WARN "$BIN_DIR 不在 PATH 中" ;; esac
 
+  default_dir
   for f in $GLOBAL_ENTRIES; do
     if [ -d "$(dirname "$f")" ]; then
-      say "$(helper upsert-block "$f" "$(cat "$TPL/agent-global-block.md")")" "$f 全局入口"
+      say "$(helper upsert-block "$f" "$(helper render "$TPL/agent-global-block.md" - "DIR=$D")")" "$f 全局入口"
     else
       say SKIPPED "$(dirname "$f") 不存在（对应工具未安装，装好后重跑 setup）"
     fi
@@ -85,15 +244,70 @@ cmd_uninstall() {
   for f in $GLOBAL_ENTRIES; do
     say "$(helper remove-block "$f")" "$f 全局入口"
   done
-  say INFO "项目内的 .local/、CLAUDE.local.md 托管块等未改动"
+  say INFO "项目内的私有工作区、CLAUDE.local.md 托管块等未改动"
 }
 
 # ---------------------------------------------------------------- init
 
+# 当前目录（git 根）若是某项目的私有工作区仓库，输出项目根
+inside_ws() { # <git 根>
+  local parent ptop
+  parent=$(dirname "$1")
+  ptop=$(git -C "$parent" rev-parse --show-toplevel 2>/dev/null) || return 1
+  [ "$ptop" = "$parent" ] || return 1
+  ( resolve_dir "$parent" 2>/dev/null; [ "$(basename "$1")" = "$D" ] ) || return 1
+  printf '%s' "$parent"
+}
+
+src_label() {
+  case $1 in
+    project) echo 项目配置 ;; env) echo 环境变量 MARGINALIA_DIR ;; user) echo "用户配置 $USER_CONFIG" ;;
+    system) echo "系统配置 $SYSTEM_CONFIG" ;; builtin) echo 内置默认 ;; legacy) echo 旧版目录名 ;; flag) echo --dir ;;
+  esac
+}
+
+# CLAUDE.md / AGENTS.md 检查与 CLAUDE.local.md 托管块（目录名取自 D）
+claude_entry() { # <工作树根> <是否 --create-claude-md>
+  local root=$1 create_claude=$2 has_claude=0 imports=0 has_agents=0 block f
+  [ -f "$root/AGENTS.md" ] && has_agents=1
+  for f in "$root/CLAUDE.md" "$root/.claude/CLAUDE.md"; do
+    if [ -f "$f" ]; then
+      has_claude=1
+      if grep -qE '^[[:space:]]*@(\./)?AGENTS\.md[[:space:]]*$' "$f"; then imports=1; fi
+    fi
+  done
+  if [ $has_agents = 1 ] && [ $has_claude = 0 ]; then
+    if [ "$create_claude" = 1 ]; then
+      printf '@AGENTS.md\n' > "$root/CLAUDE.md"; has_claude=1
+      say CREATED "CLAUDE.md（@AGENTS.md）——共享文件，需要提交到主仓库"
+    else
+      say ASK "项目只有 AGENTS.md。建议创建共享的 CLAUDE.md（内容 @AGENTS.md），加 --create-claude-md；在此之前 CLAUDE.local.md 托管块内会带 @AGENTS.md 兜底"
+    fi
+  elif [ $has_agents = 1 ] && [ $imports = 0 ]; then
+    say WARN "CLAUDE.md 没有 import AGENTS.md，Claude 不会读 AGENTS.md；建议在 CLAUDE.md 中加一行 @AGENTS.md"
+  fi
+  block=$(helper render "$TPL/claude-local-block.md" - "DIR=$D")
+  # 项目没有 CLAUDE.md 时，CLAUDE.local.md 的存在会让 Claude 不读 AGENTS.md，这里 import 兜底（文件不存在时会被静默跳过）
+  if [ $has_claude = 0 ]; then block="$block
+
+@AGENTS.md"; fi
+  say "$(helper upsert-block "$root/CLAUDE.local.md" "$block")" "CLAUDE.local.md 托管块"
+}
+
+# Claude auto memory 指向工作区的 memory/（必须是绝对路径）
+memory_entry() { # <工作树根> <memory 绝对路径> [旧路径]
+  local r
+  mkdir -p "$1/.claude"
+  r=$(helper set-memory-dir "$1/.claude/settings.local.json" "$2" "${3:-}")
+  say "${r%% *}" ".claude/settings.local.json autoMemoryDirectory → $2${r#"${r%% *}"}"
+}
+
 cmd_init() {
-  local git_init=0 update_spec=0 create_claude=0 migrate=0 dir=""
+  local git_init=0 update_spec=0 create_claude=0 migrate=0 dir="" want=""
   while [ $# -gt 0 ]; do
     case $1 in
+      --dir) [ $# -ge 2 ] || die "--dir 需要目录名"; want=$2; shift ;;
+      --dir=*) want=${1#--dir=} ;;
       --git-init) git_init=1 ;;
       --update-spec) update_spec=1 ;;
       --create-claude-md) create_claude=1 ;;
@@ -103,47 +317,64 @@ cmd_init() {
     esac
     shift
   done
+  [ -z "$want" ] || valid_dir "$want" || die "目录名不合法：${want}（只能是项目根下的一级名字，不能是 .git 等）"
   [ -d "${dir:-.}" ] || die "目录不存在：$dir"
   dir=$(cd "${dir:-.}" && pwd -P)
 
   local ROOT
   if ROOT=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null); then
-    [ "$(basename "$ROOT")" = .local ] && die "当前在 .local 仓库内，请在项目根运行"
+    if inside_ws "$ROOT" >/dev/null; then die "当前在私有工作区仓库内，请在项目根运行"; fi
   elif [ $git_init = 1 ]; then
     git -C "$dir" init -q; ROOT=$dir; say CREATED "主仓库 git init：$ROOT"
   else
     say ASK "$dir 不是 git 仓库，私有排除依赖 git。确认要在这里初始化后，加 --git-init 重跑"
     exit 3
   fi
-  local L="$ROOT/.local" MAIN changed="" d f r
+  local MAIN L changed="" d f def
+  MAIN=$(main_root "$ROOT")
+  resolve_dir "$MAIN"
+  if [ -n "$want" ] && [ "$want" != "$D" ]; then
+    if is_ws "$MAIN/$D"; then
+      say ASK "项目已有工作区 $D/；要改名为 $want/，运行 marginalia migrate --to $want"
+      exit 3
+    fi
+    D=$want; D_SRC=flag
+  fi
+  L="$ROOT/$D"
   say INFO "项目根：$ROOT"
+  say INFO "工作区目录：$D/（$(src_label "$D_SRC")）"
 
-  # worktree 与主工作区共享同一个 .local（和 Claude auto memory 跨 worktree 共享的行为一致）
-  MAIN=$(dirname "$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir)")
+  # worktree 与主工作区共享同一个工作区（和 Claude auto memory 跨 worktree 共享的行为一致）
   if [ "$MAIN" != "$ROOT" ]; then
-    [ -d "$MAIN/.local" ] || die "这是 $MAIN 的 worktree，先在主工作区运行 marginalia init"
-    if [ -L "$L" ] && [ "$(readlink "$L")" = "$MAIN/.local" ]; then
-      say SKIPPED ".local → $MAIN/.local"; L="$MAIN/.local"
+    [ -d "$MAIN/$D" ] || die "这是 $MAIN 的 worktree，先在主工作区运行 marginalia init"
+    if [ -L "$L" ] && [ "$(readlink "$L")" = "$MAIN/$D" ]; then
+      say SKIPPED "$D → $MAIN/$D"; L="$MAIN/$D"
     elif [ -e "$L" ]; then
-      say CONFLICT "worktree 里已有独立的 .local，未改为与主工作区共享"
+      say CONFLICT "worktree 里已有独立的 ${D}，未改为与主工作区共享"
     else
-      ln -s "$MAIN/.local" "$L"; say CREATED ".local → $MAIN/.local（与主工作区共享）"; L="$MAIN/.local"
+      ln -s "$MAIN/$D" "$L"; say CREATED "$D → $MAIN/${D}（与主工作区共享）"; L="$MAIN/$D"
     fi
   fi
 
-  # 1. .local 骨架与模板
+  # 1. 骨架与模板（模板里的 {{DIR}} 渲染为实际目录名）
   for d in tasks/archived docs ops scripts templates memory out logs tmp; do mkdir -p "$L/$d"; done
-  copy_tpl() { # <模板> <.local 内相对路径> <是否为托管规范>
-    local src=$1 rel=$2 managed=$3 dst="$L/$2"
+  copy_tpl() { # <模板> <工作区内相对路径> <是否为托管规范>
+    local src=$1 rel=$2 managed=$3 dst="$L/$2" new
+    new="$L/tmp/marginalia-$(basename "$rel")"
+    helper render "$src" "$new" "DIR=$D"
     if [ ! -e "$dst" ]; then
-      cp "$src" "$dst"; changed="$changed $rel"; say CREATED ".local/$rel"
-    elif [ "$managed" = 1 ] && ! cmp -s "$src" "$dst"; then
+      mv "$new" "$dst"; changed="$changed $rel"; say CREATED "$D/$rel"
+    elif [ "$managed" = 1 ] && ! cmp -s "$new" "$dst"; then
       if [ $update_spec = 1 ]; then
-        cp "$src" "$dst"; changed="$changed $rel"; say UPDATED ".local/${rel}（旧版可在 .local git 历史中找回）"
+        mv "$new" "$dst"; changed="$changed $rel"; say UPDATED "$D/${rel}（旧版可在工作区 git 历史中找回）"
+      elif [ -n "$PREV_DIR" ] && [ "$(cat "$dst")" = "$(helper render "$src" - "DIR=$PREV_DIR")" ]; then
+        # 刚改过目录名、文件没被改过：只是名字不同，直接更新
+        mv "$new" "$dst"; changed="$changed $rel"; say UPDATED "$D/${rel}（目录名随迁移更新）"
       else
-        say ASK ".local/$rel 与最新模板不同（diff -u $dst $src 查看）；更新加 --update-spec"
+        say ASK "$D/$rel 与最新模板不同（diff -u $dst ${new} 查看）；更新加 --update-spec"; return
       fi
     fi
+    rm -f "$new"
   }
   copy_tpl "$TPL/local/README.md" README.md 1
   copy_tpl "$TPL/local/task.md" templates/task.md 1
@@ -152,14 +383,17 @@ cmd_init() {
   copy_tpl "$TPL/local/MEMORY.md" memory/MEMORY.md 0
 
   if [ ! -d "$L/.git" ]; then
-    git -C "$L" init -q; say CREATED ".local git 仓库"
+    git -C "$L" init -q; say CREATED "$D git 仓库"
   fi
+  ensure_store_id "$L"
+  # 钉住目录名：之后改默认值不影响本项目
+  pin_dir "$MAIN" "$D"
 
-  # 2. 私有排除（.git/info/exclude，worktree 共用；.local 不带尾斜杠，以便匹配 worktree 里的软链）
+  # 2. 私有排除（.git/info/exclude，worktree 共用；目录名不带尾斜杠，以便匹配 worktree 里的软链）
   local EX added=0 p tracked
   EX=$(git -C "$ROOT" rev-parse --path-format=absolute --git-path info/exclude)
   mkdir -p "$(dirname "$EX")"; touch "$EX"
-  for p in .local CLAUDE.local.md .claude/settings.local.json '.claude/skills/local-*' .claude/commands/local/ \
+  for p in "$D" CLAUDE.local.md .claude/settings.local.json '.claude/skills/local-*' .claude/commands/local/ \
            '.claude/agents/local-*.md' '.claude/rules/local-*.md' '.agents/skills/local-*'; do
     if ! grep -qxF -- "$p" "$EX"; then
       [ $added = 0 ] && printf '\n# marginalia: private workspace\n' >> "$EX"
@@ -167,39 +401,14 @@ cmd_init() {
     fi
   done
   if [ $added -gt 0 ]; then say CREATED "exclude 规则 $added 条 → $EX"; else say SKIPPED "exclude 规则已齐全"; fi
-  tracked=$(git -C "$ROOT" ls-files -- .local CLAUDE.local.md .claude/settings.local.json | tr '\n' ' ')
+  tracked=$(git -C "$ROOT" ls-files -- "$D" CLAUDE.local.md .claude/settings.local.json | tr '\n' ' ')
   [ -z "$tracked" ] || say CONFLICT "以下私有路径已被主仓库跟踪，exclude 对它们不生效（未擅自 git rm --cached）：$tracked"
 
   # 3. CLAUDE.md / AGENTS.md / CLAUDE.local.md
-  local has_claude=0 imports=0 has_agents=0 block
-  [ -f "$ROOT/AGENTS.md" ] && has_agents=1
-  for f in "$ROOT/CLAUDE.md" "$ROOT/.claude/CLAUDE.md"; do
-    if [ -f "$f" ]; then
-      has_claude=1
-      if grep -qE '^[[:space:]]*@(\./)?AGENTS\.md[[:space:]]*$' "$f"; then imports=1; fi
-    fi
-  done
-  if [ $has_agents = 1 ] && [ $has_claude = 0 ]; then
-    if [ $create_claude = 1 ]; then
-      printf '@AGENTS.md\n' > "$ROOT/CLAUDE.md"; has_claude=1
-      say CREATED "CLAUDE.md（@AGENTS.md）——共享文件，需要提交到主仓库"
-    else
-      say ASK "项目只有 AGENTS.md。建议创建共享的 CLAUDE.md（内容 @AGENTS.md），加 --create-claude-md；在此之前 CLAUDE.local.md 托管块内会带 @AGENTS.md 兜底"
-    fi
-  elif [ $has_agents = 1 ] && [ $imports = 0 ]; then
-    say WARN "CLAUDE.md 没有 import AGENTS.md，Claude 不会读 AGENTS.md；建议在 CLAUDE.md 中加一行 @AGENTS.md"
-  fi
-  block=$(cat "$TPL/claude-local-block.md")
-  # 项目没有 CLAUDE.md 时，CLAUDE.local.md 的存在会让 Claude 不读 AGENTS.md，这里 import 兜底（文件不存在时会被静默跳过）
-  if [ $has_claude = 0 ]; then block="$block
+  claude_entry "$ROOT" "$create_claude"
 
-@AGENTS.md"; fi
-  say "$(helper upsert-block "$ROOT/CLAUDE.local.md" "$block")" "CLAUDE.local.md 托管块"
-
-  # 4. Claude auto memory 指向 .local/memory（必须是绝对路径）
-  mkdir -p "$ROOT/.claude"
-  r=$(helper set-memory-dir "$ROOT/.claude/settings.local.json" "$L/memory")
-  say "${r%% *}" ".claude/settings.local.json autoMemoryDirectory → $L/memory${r#"${r%% *}"}"
+  # 4. Claude auto memory 指向工作区的 memory/
+  memory_entry "$ROOT" "$L/memory"
 
   # 5. 迁移 Claude 默认 auto memory（目录名由主工作区路径中的非字母数字字符替换为 - 得到）
   local old base
@@ -217,26 +426,133 @@ cmd_init() {
         fi
         changed="$changed memory/$base"
       done
-      say MIGRATED "$old → .local/memory/（原目录保留，确认无误后可删除）"
+      say MIGRATED "$old → $D/memory/（原目录保留，确认无误后可删除）"
     else
-      say ASK "Claude 默认 auto memory 目录有内容：${old}；迁移进 .local/memory/ 加 --migrate-memory"
+      say ASK "Claude 默认 auto memory 目录有内容：${old}；迁移进 $D/memory/ 加 --migrate-memory"
     fi
   fi
 
-  # 6. commit 本次在 .local 中的变更
+  # 6. commit 本次在工作区中的变更
   # shellcheck disable=SC2086  # changed 是空格分隔的相对路径列表，均不含空格
   [ -z "$changed" ] || lcommit "$L" "chore: marginalia init" $changed
 
+  if [ "$D_SRC" = legacy ]; then
+    def=$(default_dir; printf '%s' "$D")
+    say ASK "本项目沿用旧版目录名 ${LEGACY_DIR}/（已写入项目配置）；改为 $def/ 运行 marginalia migrate（可先加 --dry-run 查看）"
+  fi
   if [ -z "$(find "$L/tasks" -mindepth 1 -maxdepth 1 -type d ! -name archived)" ]; then
     say INFO "还没有任务。预计一周以上的新项目可以走 marginalia-kickoff 启动引导"
   fi
 }
 
+# ---------------------------------------------------------------- migrate
+
+cmd_migrate() {
+  local to="" dry=0 dir="" a
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --to) [ $# -ge 2 ] || die "--to 需要目录名"; to=$2; shift ;;
+      --to=*) to=${1#--to=} ;;
+      --dry-run|-n) dry=1 ;;
+      -*) die "未知选项 $1" ;;
+      *) dir=$1 ;;
+    esac
+    shift
+  done
+  [ -d "${dir:-.}" ] || die "目录不存在：$dir"
+  dir=$(cd "${dir:-.}" && pwd -P)
+  local ROOT MAIN from moved=0 r wt wts="" EX refs
+  ROOT=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || die_nostore "不在 git 项目中"
+  if r=$(inside_ws "$ROOT"); then ROOT=$r; fi
+  MAIN=$(main_root "$ROOT")
+  resolve_dir "$MAIN"; from=$D
+  if [ -z "$to" ]; then default_dir; to=$D; fi
+  valid_dir "$to" || die "目录名不合法：${to}（只能是项目根下的一级名字，不能是 .git 等）"
+
+  if [ "$from" = "$to" ]; then
+    is_ws "$MAIN/$to" || die_nostore "项目没有私有工作区（$to/），先运行 marginalia init"
+    say SKIPPED "工作区已是 $to/，无需迁移"; return
+  fi
+  if [ ! -e "$MAIN/$from" ] && is_ws "$MAIN/$to"; then
+    moved=1; say INFO "$from/ 已移到 $to/（上次迁移中断），继续完成剩余步骤"
+  elif ! is_ws "$MAIN/$from" || [ -L "$MAIN/$from" ]; then
+    die_nostore "项目没有私有工作区（$from/）"
+  elif [ -e "$MAIN/$to" ] || [ -L "$MAIN/$to" ]; then
+    die "$MAIN/$to 已存在，未迁移"
+  fi
+  [ -z "$(git -C "$MAIN" ls-files -- "$to")" ] || die "主仓库跟踪了 $to 下的文件，不能用作私有工作区"
+
+  # 其他 worktree（只处理软链指向主工作区的）
+  while IFS= read -r wt; do
+    [ "$wt" = "$MAIN" ] || [ ! -d "$wt" ] || wts="$wts
+$wt"
+  done <<WTS
+$(git -C "$MAIN" worktree list --porcelain | sed -n 's/^worktree //p')
+WTS
+  EX=$(git -C "$MAIN" rev-parse --path-format=absolute --git-path info/exclude)
+  refs=$(helper find-refs "$MAIN/$([ $moved = 1 ] && echo "$to" || echo "$from")" "$from")
+
+  if [ $dry = 1 ]; then
+    [ $moved = 1 ] || say PLAN "移动 $MAIN/$from → $MAIN/$to"
+    say PLAN "exclude 规则 $from → ${to}（${EX}）"
+    while IFS= read -r wt; do
+      [ -n "$wt" ] || continue
+      if [ -L "$wt/$from" ]; then say PLAN "worktree 软链 $wt/$from → $wt/$to"; fi
+    done <<WTS
+$wts
+WTS
+    say PLAN "更新各工作树的 CLAUDE.local.md 托管块与 .claude/settings.local.json"
+    say PLAN "项目配置 marginalia.dir = $to"
+    [ -z "$refs" ] || say WARN "以下文件正文提到 $from/，迁移不会改写，需要的话手动更新：$(printf '%s' "$refs" | tr '\n' ' ')"
+    say INFO "迁移后正在运行的 agent 会话需要重启（auto memory 路径会变）"
+    return
+  fi
+
+  local L="$MAIN/$to"
+  if [ $moved = 0 ]; then
+    ensure_store_id "$MAIN/$from"
+    # 先钉住旧名：中途失败时，重跑能识别「已移动」并继续
+    [ -n "$(project_conf "$MAIN")" ] || git -C "$MAIN" config --local marginalia.dir "$from"
+    mv "$MAIN/$from" "$L"; say MOVED "$MAIN/$from → $L"
+  fi
+  say "$(helper exclude-rename "$EX" "$from" "$to")" "exclude 规则 $from → $to"
+
+  D=$to
+  while IFS= read -r wt; do
+    [ -n "$wt" ] || continue
+    if [ -L "$wt/$from" ]; then rm "$wt/$from"; fi
+    if [ -L "$wt/$to" ] && [ "$(readlink "$wt/$to")" = "$L" ]; then
+      :
+    elif [ -e "$wt/$to" ] || [ -L "$wt/$to" ]; then
+      say CONFLICT "$wt/$to 已存在，未改为与主工作区共享"; continue
+    elif [ -e "$wt/$from" ]; then
+      say CONFLICT "$wt/$from 是独立目录，未处理"; continue
+    elif [ -f "$wt/CLAUDE.local.md" ] || [ -f "$wt/.claude/settings.local.json" ]; then
+      ln -s "$L" "$wt/$to"; say FIXED "worktree $wt/$to → $L"
+    else
+      continue  # 这个 worktree 没有初始化过
+    fi
+    say INFO "worktree：$wt"
+    if grep -qF '<!-- marginalia:start -->' "$wt/CLAUDE.local.md" 2>/dev/null; then claude_entry "$wt" 0; fi
+    memory_entry "$wt" "$L/memory" "$MAIN/$from/memory"
+  done <<WTS
+$wts
+WTS
+  say INFO "主工作区：$MAIN"
+  memory_entry "$MAIN" "$L/memory" "$MAIN/$from/memory"
+  # 主工作区其余部分（托管块、规范文件差异等）交给 init 复查，最后钉住新名
+  pin_dir "$MAIN" "$to"
+  PREV_DIR=$from
+  cmd_init "$MAIN"
+  [ -z "$refs" ] || say WARN "以下文件正文提到 $from/，未改写，需要的话手动更新：$(printf '%s' "$refs" | tr '\n' ' ')"
+  say INFO "迁移完成。正在运行的 agent 会话需要重启（auto memory 路径已变）"
+}
+
 # ---------------------------------------------------------------- task
 
-# 在 .local 仓库里只提交指定路径：用户另外暂存的改动不会被一起提交
+# 在工作区仓库里只提交指定路径：用户另外暂存的改动不会被一起提交
 # 文件已改但 commit 失败（hook、签名等）时以退出码 4 报告，与「没改动」区分开
-lcommit() { # <.local> <message> <paths...>
+lcommit() { # <工作区> <message> <paths...>
   local L=$1 msg=$2 p
   shift 2
   for p in "$@"; do git -C "$L" add -A -- "$p" 2>/dev/null || true; done
@@ -244,17 +560,18 @@ lcommit() { # <.local> <message> <paths...>
   if git -C "$L" commit -q -m "$msg" -- "$@"; then
     say COMMITTED "$msg"
   else
-    printf 'marginalia: 文件已修改，但 .local 的 commit 失败：%s\n' "$msg" >&2
+    printf 'marginalia: 文件已修改，但工作区的 commit 失败：%s\n' "$msg" >&2
     exit 4
   fi
 }
 
 find_local() {
-  local top
-  top=$(git rev-parse --show-toplevel 2>/dev/null) || die "不在 git 项目中"
-  [ "$(basename "$top")" = .local ] && top=$(dirname "$top")
-  L="$top/.local"
-  [ -d "$L" ] || die "项目没有 .local/，先运行 marginalia init"
+  local top r
+  top=$(git rev-parse --show-toplevel 2>/dev/null) || die_nostore "不在 git 项目中"
+  if r=$(inside_ws "$top"); then top=$r; fi
+  resolve_dir "$top"
+  L="$top/$D"
+  [ -d "$L" ] || die_nostore "项目没有私有工作区（$D/），先运行 marginalia init"
 }
 
 valid_slug() {
@@ -379,6 +696,8 @@ case ${1:-} in
   setup) shift; cmd_setup "$@" ;;
   uninstall) shift; cmd_uninstall "$@" ;;
   init) shift; cmd_init "$@" ;;
+  migrate) shift; cmd_migrate "$@" ;;
+  config) shift; cmd_config "$@" ;;
   task) shift; cmd_task "$@" ;;
   -V|--version|version) echo "marginalia $VERSION" ;;
   -h|--help|help|"") usage ;;

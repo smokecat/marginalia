@@ -11,7 +11,8 @@ setup() {
   git config --global user.email test@example.com
   git config --global init.defaultBranch main
   git config --global commit.gpgsign false
-  unset CLAUDE_CONFIG_DIR CODEX_HOME
+  unset CLAUDE_CONFIG_DIR CODEX_HOME MARGINALIA_DIR MARGINALIA_USER_CONFIG
+  export MARGINALIA_SYSTEM_CONFIG="$BATS_TEST_TMPDIR/etc/marginalia/config"
   mkdir -p "$BATS_TEST_TMPDIR/proj"
   P=$(cd "$BATS_TEST_TMPDIR/proj" && pwd -P)
 }
@@ -43,22 +44,22 @@ lacks() { [[ "$output" != *"$1"* ]] || { echo "输出中不应有：$1"; echo "$
   has "[ASK]"
   run mg init --git-init "$P"
   [ "$status" -eq 0 ]
-  [ -d "$P/.git" ] && [ -d "$P/.local/.git" ]
+  [ -d "$P/.git" ] && [ -d "$P/.margin/.git" ]
 }
 
 @test "init：落地骨架、exclude、CLAUDE.local.md、memory 设置，主仓库保持干净" {
   init_repo "$P"
   run mg init "$P"
   [ "$status" -eq 0 ]
-  for f in README.md .gitignore todo.md templates/task.md memory/MEMORY.md; do [ -f "$P/.local/$f" ]; done
-  for d in tasks/archived docs ops scripts out logs tmp; do [ -d "$P/.local/$d" ]; done
-  [ "$(git -C "$P/.local" log --oneline | wc -l | tr -d ' ')" = 1 ]
-  grep -qxF .local "$P/.git/info/exclude"
+  for f in README.md .gitignore todo.md templates/task.md memory/MEMORY.md; do [ -f "$P/.margin/$f" ]; done
+  for d in tasks/archived docs ops scripts out logs tmp; do [ -d "$P/.margin/$d" ]; done
+  [ "$(git -C "$P/.margin" log --oneline | wc -l | tr -d ' ')" = 1 ]
+  grep -qxF .margin "$P/.git/info/exclude"
   grep -qxF CLAUDE.local.md "$P/.git/info/exclude"
   grep -q "marginalia:start" "$P/CLAUDE.local.md"
   grep -qxF "@AGENTS.md" "$P/CLAUDE.local.md"       # 没有 CLAUDE.md 时兜底 import
   python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["autoMemoryDirectory"]==sys.argv[2]' \
-    "$P/.claude/settings.local.json" "$P/.local/memory"
+    "$P/.claude/settings.local.json" "$P/.margin/memory"
   [ -z "$(git -C "$P" status --porcelain)" ]
 }
 
@@ -69,8 +70,8 @@ lacks() { [[ "$output" != *"$1"* ]] || { echo "输出中不应有：$1"; echo "$
   [ "$status" -eq 0 ]
   lacks "[CREATED]"
   lacks "[COMMITTED]"
-  [ "$(git -C "$P/.local" log --oneline | wc -l | tr -d ' ')" = 1 ]
-  [ "$(grep -c '^\.local$' "$P/.git/info/exclude")" = 1 ]
+  [ "$(git -C "$P/.margin" log --oneline | wc -l | tr -d ' ')" = 1 ]
+  [ "$(grep -c '^\.margin$' "$P/.git/info/exclude")" = 1 ]
 }
 
 @test "init：只有 AGENTS.md 时询问，--create-claude-md 后托管块不再带 import" {
@@ -108,10 +109,10 @@ lacks() { [[ "$output" != *"$1"* ]] || { echo "输出中不应有：$1"; echo "$
   init_repo "$P"
   mg init "$P"
   printf '尾部内容\n' >> "$P/CLAUDE.local.md"
-  sed 's/私有工作区（.local\/）/被改掉/' "$P/CLAUDE.local.md" > "$P/x" && mv "$P/x" "$P/CLAUDE.local.md"
+  sed 's/私有工作区（.margin\/）/被改掉/' "$P/CLAUDE.local.md" > "$P/x" && mv "$P/x" "$P/CLAUDE.local.md"
   run mg init "$P"
   has "[UPDATED] CLAUDE.local.md"
-  grep -q "私有工作区（.local/）" "$P/CLAUDE.local.md"
+  grep -q "私有工作区（.margin/）" "$P/CLAUDE.local.md"
   [ "$(tail -1 "$P/CLAUDE.local.md")" = "尾部内容" ]
 }
 
@@ -127,14 +128,16 @@ lacks() { [[ "$output" != *"$1"* ]] || { echo "输出中不应有：$1"; echo "$
 @test "init：规范模板有差异时询问，--update-spec 后覆盖并 commit" {
   init_repo "$P"
   mg init "$P"
-  echo "本地改动" >> "$P/.local/README.md"
-  git -C "$P/.local" commit -qam "local edit"
+  echo "本地改动" >> "$P/.margin/README.md"
+  git -C "$P/.margin" commit -qam "local edit"
   run mg init "$P"
-  has "[ASK] .local/README.md"
+  has "[ASK] .margin/README.md"
+  has "marginalia-README.md 查看"
+  [ -f "$P/.margin/tmp/marginalia-README.md" ]
   run mg init --update-spec "$P"
-  has "[UPDATED] .local/README.md"
+  has "[UPDATED] .margin/README.md"
   has "[COMMITTED]"
-  cmp -s "$P/.local/README.md" "$REPO/templates/local/README.md"
+  [ "$(cat "$P/.margin/README.md")" = "$(python3 "$REPO/lib/helpers.py" render "$REPO/templates/local/README.md" - DIR=.margin)" ]
 }
 
 @test "init：私有路径已被主仓库跟踪时报告冲突" {
@@ -155,11 +158,11 @@ lacks() { [[ "$output" != *"$1"* ]] || { echo "输出中不应有：$1"; echo "$
   has "--migrate-memory"
   run mg init --migrate-memory "$P"
   has "[MIGRATED]"
-  grep -q "trap.md" "$P/.local/memory/MEMORY.md"
-  [ -f "$P/.local/memory/trap.md" ] && [ -f "$old/trap.md" ]
+  grep -q "trap.md" "$P/.margin/memory/MEMORY.md"
+  [ -f "$P/.margin/memory/trap.md" ] && [ -f "$old/trap.md" ]
 }
 
-@test "init：worktree 要求主工作区先初始化，之后共享同一个 .local" {
+@test "init：worktree 要求主工作区先初始化，之后共享同一个 .margin" {
   init_repo "$P"
   git -C "$P" commit -q --allow-empty -m init
   git -C "$P" worktree add -q "$BATS_TEST_TMPDIR/wt"
@@ -171,16 +174,16 @@ lacks() { [[ "$output" != *"$1"* ]] || { echo "输出中不应有：$1"; echo "$
   mg init "$P"
   run mg init "$wt"
   [ "$status" -eq 0 ]
-  [ "$(readlink "$wt/.local")" = "$P/.local" ]
-  grep -q "\"$P/.local/memory\"" "$wt/.claude/settings.local.json"
+  [ "$(readlink "$wt/.margin")" = "$P/.margin" ]
+  grep -q "\"$P/.margin/memory\"" "$wt/.claude/settings.local.json"
   [ -z "$(git -C "$wt" status --porcelain)" ]
   (cd "$wt" && mg task new from-wt >/dev/null)
-  [ -f "$P/.local/tasks/from-wt/README.md" ]
+  [ -f "$P/.margin/tasks/from-wt/README.md" ]
 }
 
 # ------------------------------------------------------------------ task
 
-@test "task：项目没有 .local 时报错" {
+@test "task：项目没有 .margin 时报错" {
   init_repo "$P"
   cd "$P"
   run mg task list
@@ -194,8 +197,8 @@ lacks() { [[ "$output" != *"$1"* ]] || { echo "输出中不应有：$1"; echo "$
   mkdir -p "$P/src" && cd "$P/src"
   run mg task new fix-login '修复登录 & 会话 "问题" \1'
   [ "$status" -eq 0 ]
-  grep -qxF '# 修复登录 & 会话 "问题" \1' "$P/.local/tasks/fix-login/README.md"
-  sed 's/^- \*\*当前状态\*\*：$/- **当前状态**：定位到 token 刷新/' "$P/.local/tasks/fix-login/README.md" > x && mv x "$P/.local/tasks/fix-login/README.md"
+  grep -qxF '# 修复登录 & 会话 "问题" \1' "$P/.margin/tasks/fix-login/README.md"
+  sed 's/^- \*\*当前状态\*\*：$/- **当前状态**：定位到 token 刷新/' "$P/.margin/tasks/fix-login/README.md" > x && mv x "$P/.margin/tasks/fix-login/README.md"
 
   run mg task list
   has "fix-login"
@@ -206,22 +209,22 @@ lacks() { [[ "$output" != *"$1"* ]] || { echo "输出中不应有：$1"; echo "$
   [ "$status" -ne 0 ]
   run mg task status fix-login blocked
   [ "$status" -eq 0 ]
-  grep -qx "status: blocked" "$P/.local/tasks/fix-login/README.md"
+  grep -qx "status: blocked" "$P/.margin/tasks/fix-login/README.md"
 
   run mg task archive fix-login
   [ "$status" -ne 0 ]
   has "--force"
   run mg task archive fix-login 修好了 token 刷新 --force
   [ "$status" -eq 0 ]
-  local f="$P/.local/tasks/archived/fix-login/README.md"
+  local f="$P/.margin/tasks/archived/fix-login/README.md"
   grep -qx "result: 修好了 token 刷新" "$f"
   grep -q "^archived: " "$f"
 
   run mg task list
   has "没有未归档任务"
   has "已归档：1 个"
-  [ -z "$(git -C "$P/.local" status --porcelain)" ]
-  [ "$(git -C "$P/.local" log --oneline | wc -l | tr -d ' ')" = 4 ]
+  [ -z "$(git -C "$P/.margin" status --porcelain)" ]
+  [ "$(git -C "$P/.margin" log --oneline | wc -l | tr -d ' ')" = 4 ]
 }
 
 @test "task：拒绝非法 slug 和重复任务" {
@@ -236,10 +239,10 @@ lacks() { [[ "$output" != *"$1"* ]] || { echo "输出中不应有：$1"; echo "$
   has "任务已存在"
 }
 
-@test "task：在 .local 目录内也能定位项目" {
+@test "task：在 .margin 目录内也能定位项目" {
   init_repo "$P"
   mg init "$P"
-  cd "$P/.local/tasks"
+  cd "$P/.margin/tasks"
   run mg task list
   [ "$status" -eq 0 ]
 }
@@ -248,11 +251,11 @@ lacks() { [[ "$output" != *"$1"* ]] || { echo "输出中不应有：$1"; echo "$
   init_repo "$P"
   mg init "$P"
   cd "$P"
-  mkdir -p "$P/.local/x" && printf -- '---\nstatus: active\n---\n# x\n' > "$P/.local/x/README.md"
+  mkdir -p "$P/.margin/x" && printf -- '---\nstatus: active\n---\n# x\n' > "$P/.margin/x/README.md"
   run mg task status ../x done
   [ "$status" -ne 0 ]
   has "kebab-case"
-  grep -qx "status: active" "$P/.local/x/README.md"
+  grep -qx "status: active" "$P/.margin/x/README.md"
   run mg task archive ../x --force
   [ "$status" -ne 0 ]
   has "kebab-case"
@@ -262,11 +265,11 @@ lacks() { [[ "$output" != *"$1"* ]] || { echo "输出中不应有：$1"; echo "$
   init_repo "$P"
   mg init "$P"
   cd "$P"
-  echo note >> "$P/.local/todo.md"
-  git -C "$P/.local" add todo.md
+  echo note >> "$P/.margin/todo.md"
+  git -C "$P/.margin" add todo.md
   mg task new keep-staged
-  [ "$(git -C "$P/.local" diff --cached --name-only)" = "todo.md" ]
-  ! git -C "$P/.local" show --name-only --format= HEAD | grep -q todo.md
+  [ "$(git -C "$P/.margin" diff --cached --name-only)" = "todo.md" ]
+  ! git -C "$P/.margin" show --name-only --format= HEAD | grep -q todo.md
 }
 
 @test "task：重复归档已归档的任务不报错" {
@@ -286,7 +289,7 @@ lacks() { [[ "$output" != *"$1"* ]] || { echo "输出中不应有：$1"; echo "$
   cd "$P"
   mg task new alpha 'Alpha 任务'
   mg task new beta
-  sed 's/^- \*\*下一步\*\*：.*$/- **下一步**：跑测试/' "$P/.local/tasks/alpha/README.md" > x && mv x "$P/.local/tasks/alpha/README.md"
+  sed 's/^- \*\*下一步\*\*：.*$/- **下一步**：跑测试/' "$P/.margin/tasks/alpha/README.md" > x && mv x "$P/.margin/tasks/alpha/README.md"
   mg task status beta done
   mg task archive beta
   run mg task list --json
@@ -299,11 +302,11 @@ assert [t["slug"] for t in d["tasks"]] == ["alpha"], d
 t = d["tasks"][0]
 assert t["title"] == "Alpha 任务" and t["status"] == "active" and t["archived"] is False
 assert t["resume"]["next"] == "跑测试" and t["resume"]["state"] == "", t
-assert t["path"] == ".local/tasks/alpha/README.md"
+assert t["path"] == ".margin/tasks/alpha/README.md"
 assert d["archivedCount"] == 1
 PY
   run mg task list --json --archived
-  python3 -c 'import json,sys; d=json.loads(sys.argv[1]); a=[t for t in d["tasks"] if t["archived"]]; assert [t["slug"] for t in a]==["beta"] and a[0]["path"]==".local/tasks/archived/beta/README.md"' "$output"
+  python3 -c 'import json,sys; d=json.loads(sys.argv[1]); a=[t for t in d["tasks"] if t["archived"]]; assert [t["slug"] for t in a]==["beta"] and a[0]["path"]==".margin/tasks/archived/beta/README.md"' "$output"
   run mg task show beta --json
   [ "$status" -eq 0 ]
   python3 -c 'import json,sys; t=json.loads(sys.argv[1])["task"]; assert t["archived"] and "todo" in t and "goal" in t' "$output"
@@ -317,7 +320,7 @@ ext() { # <op> <json>
   printf '%s' "$2" | TRINE_EXT_DIR="$REPO/integrations/trine" python3 "$REPO/integrations/trine/bin/trine-ext" "$1"
 }
 
-@test "trine 扩展：没有 .local 时返回空视图而不是报错" {
+@test "trine 扩展：没有 .margin 时返回空视图而不是报错" {
   init_repo "$P"
   cd "$P"
   run ext view '{"op":"view","point":"sessionPanel","context":{"cwd":"x","linkedSessions":[]}}'
@@ -350,7 +353,7 @@ new = alpha["actions"][0]["effects"][0]
 assert new["type"] == "session.create" and new["prompt"] == "继续 alpha 任务"
 assert new["links"][0]["label"] == "Alpha 任务" and new["links"][0]["ref"].endswith(":alpha")
 # 会话开在 src/ 里：插入的引用相对会话目录
-assert alpha["actions"][2]["effects"][0]["text"] == "../.local/tasks/alpha/README.md", alpha["actions"][2]
+assert alpha["actions"][2]["effects"][0]["text"] == "../.margin/tasks/alpha/README.md", alpha["actions"][2]
 PY
 }
 
@@ -369,9 +372,9 @@ PY
   python3 -c 'import json,sys; i=json.loads(sys.argv[1])["items"]; assert i[0]["effects"]==[{"type":"prompt.insert","text":"继续 alpha 任务"}] and i[0]["link"]["ref"].endswith(":alpha"), i' "$output"
   run ext action '{"op":"action","context":{},"args":{"actionId":"status","params":{"slug":"alpha","status":"done"}}}'
   [ "$status" -eq 0 ]
-  grep -qx "status: done" "$P/.local/tasks/alpha/README.md"
+  grep -qx "status: done" "$P/.margin/tasks/alpha/README.md"
   run ext action '{"op":"action","context":{},"args":{"actionId":"archive","params":{"slug":"alpha"}}}'
-  [ -d "$P/.local/tasks/archived/alpha" ]
+  [ -d "$P/.margin/tasks/archived/alpha" ]
   run ext action '{"op":"action","context":{},"args":{"actionId":"archive","params":{"slug":"alpha"}}}'
   has '"ok": true'
 }
@@ -380,7 +383,7 @@ PY
   init_repo "$P"
   mg init "$P"
   cd "$P"
-  mkdir -p "$P/.local/tasks/broken" && echo '# 没有 frontmatter' > "$P/.local/tasks/broken/README.md"
+  mkdir -p "$P/.margin/tasks/broken" && echo '# 没有 frontmatter' > "$P/.margin/tasks/broken/README.md"
   run mg task list --json
   python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["tasks"]==[] and d["errors"][0]["slug"]=="broken", d' "$output"
   run ext view '{"op":"view","point":"workspacePanel","context":{"cwd":"'"$P"'","linkedSessions":[]}}'
@@ -391,7 +394,7 @@ PY
   init_repo "$P"
   mg init "$P"
   cd "$P"
-  python3 - "$P/.local/tasks" <<'PY'
+  python3 - "$P/.margin/tasks" <<'PY'
 import os, sys
 for i in range(200):
     d = os.path.join(sys.argv[1], "t%03d" % i)
@@ -408,10 +411,10 @@ PY
   mg init "$P"
   cd "$P"
   mg task new late
-  mv "$P/.local/tasks/late" "$P/.local/tasks/archived/late"
+  mv "$P/.margin/tasks/late" "$P/.margin/tasks/archived/late"
   run mg task archive late --force
   [ "$status" -eq 0 ]
-  [ -z "$(git -C "$P/.local" status --porcelain)" ]
+  [ -z "$(git -C "$P/.margin" status --porcelain)" ]
 }
 
 @test "task list --archived：文本输出也列出已归档任务" {
@@ -463,4 +466,241 @@ PY
   [ "$(cat "$HOME/.codex/AGENTS.md")" = "# 我自己的 Codex 说明" ]
   [ ! -e "$HOME/.gemini/GEMINI.md" ]
   [ -d "$HOME/.agents/skills/other" ] && [ -L "$HOME/.claude/skills/not-ours" ]
+}
+
+# ------------------------------------------------------------------ 目录名配置
+
+# 造一个旧版（目录名 .local、没有项目配置、没有 storeId）的项目
+legacy_project() {
+  init_repo "$P"
+  git -C "$P" commit -q --allow-empty -m init
+  MARGINALIA_DIR=.local mg init "$P" >/dev/null
+  git -C "$P" config --local --unset marginalia.dir
+  git -C "$P/.local" config --local --unset marginalia.storeId
+}
+
+@test "config：系统 < 用户 < 环境变量 < 项目，--list 标出来源" {
+  init_repo "$P"
+  cd "$P"
+  run mg config dir
+  [ "$output" = ".margin" ]
+  mkdir -p "$(dirname "$MARGINALIA_SYSTEM_CONFIG")"
+  git config -f "$MARGINALIA_SYSTEM_CONFIG" marginalia.dir .sys
+  [ "$(mg config dir)" = ".sys" ]
+  mg config --user dir .usr
+  [ "$(git config -f "$HOME/.marginalia/config" marginalia.dir)" = ".usr" ]
+  [ "$(mg config dir)" = ".usr" ]
+  [ "$(MARGINALIA_DIR=.env mg config dir)" = ".env" ]
+  mg config --project dir .proj
+  [ "$(MARGINALIA_DIR=.env mg config dir)" = ".proj" ]
+  run mg config --list
+  has "本项目：.proj（project）"
+  has "新项目默认：.usr（user）"
+  mg config --user --unset dir
+  [ "$(mg config --user dir)" = "" ]
+}
+
+@test "config：拒绝不合法的目录名，设置时必须指定级别" {
+  init_repo "$P"
+  cd "$P"
+  for bad in .git . .. a/b '' .claude 'a b'; do
+    run mg config --user dir "$bad"
+    [ "$status" -ne 0 ]
+  done
+  run mg config dir .x
+  [ "$status" -ne 0 ]
+  has "需要指定级别"
+  mkdir -p "$HOME/.marginalia" && printf '[marginalia]\n\tdir = ../x\n' > "$HOME/.marginalia/config"
+  run mg config dir
+  [ "$status" -ne 0 ]
+  has "目录名不合法"
+}
+
+@test "config：已有工作区时不能直接改项目配置，提示 migrate" {
+  init_repo "$P"
+  mg init "$P"
+  cd "$P"
+  run mg config --project dir .other
+  [ "$status" -ne 0 ]
+  has "marginalia migrate --to .other"
+  [ "$(git -C "$P" config marginalia.dir)" = ".margin" ]
+}
+
+@test "init --dir：使用指定目录名并写入项目配置；之后改默认值不影响已有项目" {
+  init_repo "$P"
+  run mg init --dir .notes "$P"
+  [ "$status" -eq 0 ]
+  [ -d "$P/.notes/.git" ] && [ ! -e "$P/.margin" ]
+  [ "$(git -C "$P" config marginalia.dir)" = ".notes" ]
+  grep -qxF .notes "$P/.git/info/exclude"
+  grep -q "私有工作区（.notes/）" "$P/CLAUDE.local.md"
+  grep -q "^# .notes — 私有工作区" "$P/.notes/README.md"
+  grep -q "\"$P/.notes/memory\"" "$P/.claude/settings.local.json"
+  [ -z "$(git -C "$P" status --porcelain)" ]
+  mg config --user dir .elsewhere
+  cd "$P"
+  run mg task new still-here
+  [ "$status" -eq 0 ]
+  [ -f "$P/.notes/tasks/still-here/README.md" ]
+  cd "$P/.notes/tasks"
+  run mg task list
+  has "still-here"
+  run mg init "$P"
+  lacks "[CREATED]"
+}
+
+@test "init --dir：已有工作区且名字不同时询问，不搬目录" {
+  init_repo "$P"
+  mg init "$P"
+  run mg init --dir .other "$P"
+  [ "$status" -eq 3 ]
+  has "marginalia migrate --to .other"
+  [ -d "$P/.margin" ] && [ ! -e "$P/.other" ]
+}
+
+@test "init：worktree 里沿用主工作区的目录名" {
+  init_repo "$P"
+  git -C "$P" commit -q --allow-empty -m init
+  mg init --dir .notes "$P"
+  git -C "$P" worktree add -q "$BATS_TEST_TMPDIR/wt"
+  local wt
+  wt=$(cd "$BATS_TEST_TMPDIR/wt" && pwd -P)
+  run mg init "$wt"
+  [ "$status" -eq 0 ]
+  [ "$(readlink "$wt/.notes")" = "$P/.notes" ]
+  [ -z "$(git -C "$wt" status --porcelain)" ]
+}
+
+@test "旧版 .local 项目：不迁移也照常工作，init 钉住 .local 并提示 migrate" {
+  legacy_project
+  cd "$P"
+  run mg task new old-way
+  [ "$status" -eq 0 ]
+  [ -f "$P/.local/tasks/old-way/README.md" ]
+  run mg init "$P"
+  [ "$status" -eq 0 ]
+  has "marginalia migrate"
+  lacks "[ASK] .local/README.md"      # 规范文件按 .local 渲染，与旧版一致
+  [ ! -e "$P/.margin" ]
+  [ "$(git -C "$P" config marginalia.dir)" = ".local" ]
+}
+
+@test "没有工作区时 task 命令以退出码 5 结束" {
+  init_repo "$P"
+  cd "$P"
+  run mg task list --json
+  [ "$status" -eq 5 ]
+  cd "$BATS_TEST_TMPDIR"
+  run mg task list
+  [ "$status" -eq 5 ]
+}
+
+# ------------------------------------------------------------------ migrate
+
+@test "migrate：旧版 .local 迁到 .margin，worktree、exclude、托管块、settings、store id 都跟着改" {
+  legacy_project
+  echo "看 .local/docs/x.md；~/.local/bin 不算" > "$P/.local/docs/ref.md"
+  git -C "$P/.local" add docs && git -C "$P/.local" commit -qm docs
+  git -C "$P" worktree add -q "$BATS_TEST_TMPDIR/wt"
+  local wt
+  wt=$(cd "$BATS_TEST_TMPDIR/wt" && pwd -P)
+  mg init "$wt" >/dev/null
+  git -C "$P" config --local --unset marginalia.dir      # init 会钉住，这里还原成旧版状态
+  cd "$P"
+  mg task new keep-link
+  local store_before
+  store_before=$(mg task list --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["store"]["id"])')
+
+  run mg migrate --dry-run
+  [ "$status" -eq 0 ]
+  has "[PLAN] 移动 $P/.local → $P/.margin"
+  has "worktree 软链"
+  has "docs/ref.md"
+  [ -d "$P/.local" ] && [ ! -e "$P/.margin" ]
+
+  run mg migrate
+  [ "$status" -eq 0 ]
+  has "[MOVED]"
+  [ ! -e "$P/.local" ] && [ -d "$P/.margin/tasks/keep-link" ]
+  [ "$(git -C "$P" config marginalia.dir)" = ".margin" ]
+  grep -qxF .margin "$P/.git/info/exclude"
+  [ "$(grep -cxF .local "$P/.git/info/exclude")" = 0 ]
+  [ ! -e "$wt/.local" ] && [ "$(readlink "$wt/.margin")" = "$P/.margin" ]
+  for r in "$P" "$wt"; do
+    grep -q "私有工作区（.margin/）" "$r/CLAUDE.local.md"
+    grep -q "\"$P/.margin/memory\"" "$r/.claude/settings.local.json"
+    [ -z "$(git -C "$r" status --porcelain)" ]
+  done
+  has "docs/ref.md"
+  [ "$(mg task list --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["store"]["id"])')" = "$store_before" ]
+  (cd "$wt" && mg task new from-wt >/dev/null)
+  [ -f "$P/.margin/tasks/from-wt/README.md" ]
+
+  run mg migrate
+  [ "$status" -eq 0 ]
+  has "无需迁移"
+}
+
+@test "migrate --to：可以改成任意名字，也能迁回去" {
+  init_repo "$P"
+  mg init "$P"
+  cd "$P"
+  mg task new t1
+  run mg migrate --to .notes
+  [ "$status" -eq 0 ]
+  has "[UPDATED] .notes/README.md（目录名随迁移更新）"
+  grep -q "^# .notes — 私有工作区" "$P/.notes/README.md"
+  [ -z "$(git -C "$P/.notes" status --porcelain)" ]
+  [ -d "$P/.notes/tasks/t1" ] && [ ! -e "$P/.margin" ]
+  grep -q "\"$P/.notes/memory\"" "$P/.claude/settings.local.json"
+  run mg migrate --to .margin
+  [ "$status" -eq 0 ]
+  [ -d "$P/.margin/tasks/t1" ] && [ ! -e "$P/.notes" ]
+  [ "$(grep -c '^\.margin$' "$P/.git/info/exclude")" = 1 ]
+  [ "$(grep -cxF .notes "$P/.git/info/exclude")" = 0 ]
+}
+
+@test "migrate：目标已存在时拒绝；中途中断后重跑能继续" {
+  init_repo "$P"
+  mg init "$P"
+  mkdir "$P/.taken"
+  run mg migrate --to .taken "$P"
+  [ "$status" -ne 0 ]
+  has "已存在"
+  [ -d "$P/.margin" ]
+  # 模拟只完成了移动
+  mv "$P/.margin" "$P/.moved"
+  run mg migrate --to .moved "$P"
+  [ "$status" -eq 0 ]
+  has "上次迁移中断"
+  [ "$(git -C "$P" config marginalia.dir)" = ".moved" ]
+  grep -qxF .moved "$P/.git/info/exclude"
+  grep -q "\"$P/.moved/memory\"" "$P/.claude/settings.local.json"
+}
+
+@test "migrate：项目没有工作区时退出码 5" {
+  init_repo "$P"
+  run mg migrate "$P"
+  [ "$status" -eq 5 ]
+}
+
+@test "setup：全局入口按用户默认目录名生成" {
+  mkdir -p "$HOME/.codex"
+  mg config --user dir .notes
+  mg setup
+  grep -q '`.notes/README.md`' "$HOME/.codex/AGENTS.md"
+  grep -q 'git config marginalia.dir' "$HOME/.codex/AGENTS.md"
+}
+
+@test "trine 扩展：迁移后会话关联（store id）不变，插入的路径用新目录名" {
+  legacy_project
+  cd "$P"
+  mg task new alpha
+  local store
+  store=$(mg task list --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["store"]["id"])')
+  mg migrate >/dev/null
+  run ext badge '{"op":"badge","context":{"session":{"id":"s","links":[{"ref":"'"$store"':alpha","label":"a"}]}}}'
+  python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["badge"]["text"]=="进行中", d' "$output"
+  run ext pick '{"op":"pick","point":"composerAction","context":{"cwd":"'"$P"'"},"args":{"query":"alp"}}'
+  python3 -c 'import json,sys; i=json.loads(sys.argv[1])["items"]; assert i[0]["effects"][0]["text"]==".margin/tasks/alpha/README.md", i' "$output"
 }

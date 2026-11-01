@@ -1,6 +1,6 @@
 ---
 name: marginalia-kickoff
-description: 新项目启动引导：需求澄清 → 背景盘点 → 技术调研 → 选型决策 → 目录规划，产出存入 .local/tasks/project-kickoff/，可中断接续。只在用户明确要求时使用，适合预计一周以上的项目（小项目直接开干）。
+description: 新项目启动引导：需求澄清 → 背景盘点 → 技术调研 → 选型决策 → 目录规划，产出存入私有工作区（默认 .margin/）的 tasks/project-kickoff/，可中断接续。只在用户明确要求时使用，适合预计一周以上的项目（小项目直接开干）。
 license: MIT
 ---
 
@@ -8,15 +8,15 @@ license: MIT
 
 ## 前置
 
-- 项目没有 .local/ → 说明需要先初始化，征得同意后按 marginalia-init 执行，再继续
-- `.local/tasks/project-kickoff/` 已存在 → 读它的接续指引，从中断处继续
+- 项目没有私有工作区 → 说明需要先初始化，征得同意后按 marginalia-init 执行，再继续
+- 工作区里 `tasks/project-kickoff/` 已存在 → 读它的接续指引，从中断处继续
 - 否则 `marginalia task new project-kickoff 项目启动`，待办预填下面五个阶段
 
 kickoff 本身就是项目的第一个任务。每个阶段结束时落盘、刷新接续指引并 commit。
 
 ## 产出
 
-`.local/tasks/project-kickoff/` 下：REQUIREMENTS.md、RESEARCH.md（以及每个方向一份 research-<方向>.md）、DECISIONS.md、STRUCTURE.md。
+工作区的 `tasks/project-kickoff/` 下：REQUIREMENTS.md、RESEARCH.md（以及每个方向一份 research-<方向>.md）、DECISIONS.md、STRUCTURE.md。
 
 ## 阶段
 
