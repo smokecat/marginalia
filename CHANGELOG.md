@@ -15,7 +15,7 @@
 
 - 目录名分级配置：系统 `/etc/marginalia/config` < 用户 `~/.marginalia/config` < 环境变量 `MARGINALIA_DIR` < 项目（`.git/config` 的 `marginalia.dir`）；`marginalia config` 查看和设置。
 - `marginalia init --dir <名字>`：为项目指定目录名；`init` 会把实际用的目录名写进项目配置，之后改默认值不影响已有项目。
-- `marginalia migrate [--to 名字] [--dry-run]`：给已有工作区改名（包括把旧版 `.local` 迁到 `.margin`），同步 worktree 软链、exclude、托管块和 auto memory 设置，可重跑、可迁回；列出正文里还提到旧目录名的文件。
+- `marginalia migrate [--to 名字] [--dry-run]`：给已有工作区改名（包括把旧版 `.local` 迁到 `.margin`），同步 worktree 软链、exclude、托管块、auto memory 设置和 `.claude/`、`.agents/` 下指进工作区的软链，可重跑、可迁回；列出正文里还提到旧目录名的文件。
 - 旧版 `.local` 项目不迁移也能照常使用。
 - `task list --json` / `task show --json` 的 `store` 增加 `dir`、`project`。
 

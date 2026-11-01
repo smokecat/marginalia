@@ -134,7 +134,7 @@ marginalia migrate --dry-run    # 先看计划
 marginalia migrate              # 改为当前默认目录名；--to <名字> 指定其他名字
 ```
 
-`migrate` 移动工作区目录，同步更新 exclude 规则、各 worktree 的软链、`CLAUDE.local.md` 托管块、`.claude/settings.local.json` 和项目配置，没改过的规范文件随之更新。任务库身份（`store.id`）保持不变，trine 里已有的会话关联不受影响。中途失败的话重跑就能继续；`--to .local` 可以迁回去。
+`migrate` 移动工作区目录，同步更新 exclude 规则、各 worktree 的软链、`CLAUDE.local.md` 托管块、`.claude/settings.local.json`、`.claude/` 和 `.agents/` 下指进工作区的软链（如 `local-*` 私有 skill）和项目配置，没改过的规范文件随之更新。任务库身份（`store.id`）保持不变，trine 里已有的会话关联不受影响。中途失败的话重跑就能继续；`--to .local` 可以迁回去。
 
 任务、经验等正文里写着的旧路径不会被改写，`migrate` 会把这些文件列出来，按需手动修改。迁移后本项目里正在运行的 agent 会话需要重启（auto memory 路径变了）。
 

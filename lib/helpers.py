@@ -302,6 +302,35 @@ def find_refs(local, name):
     return "\n".join(hits)
 
 
+LINK_DIRS = (".claude", ".agents")
+
+
+def relink(root, old, new, dry=""):
+    """root 下 .claude/、.agents/ 里目标落在 old 内的软链改指 new 下的对应位置（相对链接仍写相对路径）。
+    每改一条输出一行「链接 → 新目标」；dry 非空时只输出不改。"""
+    out = []
+    for top in LINK_DIRS:
+        base_dir = os.path.join(root, top)
+        if not os.path.isdir(base_dir) or os.path.islink(base_dir):
+            continue
+        for base, dirs, files in os.walk(base_dir):
+            for name in sorted(dirs + files):
+                link = os.path.join(base, name)
+                if not os.path.islink(link):
+                    continue
+                target = os.readlink(link)
+                dest = os.path.normpath(os.path.join(base, target))
+                if dest != old and not dest.startswith(old + os.sep):
+                    continue
+                moved = new + dest[len(old):]
+                fresh = moved if os.path.isabs(target) else os.path.relpath(moved, base)
+                if not dry:
+                    os.remove(link)
+                    os.symlink(fresh, link)
+                out.append("%s → %s" % (os.path.relpath(link, root), fresh))
+    return "\n".join(out)
+
+
 COMMANDS = {
     "upsert-block": upsert_block,
     "remove-block": remove_block,
@@ -316,6 +345,7 @@ COMMANDS = {
     "spec-pristine": spec_pristine,
     "exclude-rename": exclude_rename,
     "find-refs": find_refs,
+    "relink": relink,
     "realpath": os.path.realpath,
 }
 

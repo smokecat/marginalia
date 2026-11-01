@@ -460,6 +460,12 @@ cmd_init() {
 
 # ---------------------------------------------------------------- migrate
 
+# .claude/、.agents/ 下指进旧工作区的软链（如 local-* 私有 skill）改指新位置，相对链接保持相对
+relinks() { # <工作树根> <旧路径> <新路径>
+  local r
+  helper relink "$1" "$2" "$3" | while IFS= read -r r; do say FIXED "软链 $r"; done
+}
+
 cmd_migrate() {
   local to="" dry=0 dir="" a
   while [ $# -gt 0 ]; do
@@ -551,6 +557,13 @@ WTS
 $wts
 WTS
     say PLAN "更新各工作树的 CLAUDE.local.md 托管块与 .claude/settings.local.json"
+    while IFS= read -r wt; do
+      [ -n "$wt" ] || continue
+      helper relink "$wt" "$wt/$from" "$wt/$to" dry | while IFS= read -r r; do say PLAN "软链 $r"; done
+      [ "$wt" = "$MAIN" ] || helper relink "$wt" "$OLD" "$L" dry | while IFS= read -r r; do say PLAN "软链 $r"; done
+    done <<WTS
+$MAIN$wts
+WTS
     say PLAN "项目配置 marginalia.dir = $to"
     [ -z "$refs" ] || say WARN "以下文件正文提到 $from/，迁移不会改写，需要的话手动更新：$(printf '%s' "$refs" | tr '\n' ' ')"
     say INFO "迁移后正在运行的 agent 会话需要重启（auto memory 路径会变）"
@@ -584,11 +597,14 @@ WTS
     say INFO "worktree：$wt"
     if grep -qF '<!-- marginalia:start -->' "$wt/CLAUDE.local.md" 2>/dev/null; then claude_entry "$wt" 0; fi
     memory_entry "$wt" "$L/memory" "$OLD/memory"
+    relinks "$wt" "$wt/$from" "$wt/$to"
+    relinks "$wt" "$OLD" "$L"
   done <<WTS
 $wts
 WTS
   say INFO "主工作区：$MAIN"
   memory_entry "$MAIN" "$L/memory" "$OLD/memory"
+  relinks "$MAIN" "$OLD" "$L"
   # 主工作区其余部分（托管块、规范文件等）交给 init；init 失败（如 commit 失败）时标记保留，重跑继续
   PREV_DIR=$from
   cmd_init "$MAIN"

@@ -815,3 +815,28 @@ legacy_project() {
   [ "$status" -eq 0 ]
   grep -q "\"$P/.margin/memory\"" "$P/.claude/settings.local.json"
 }
+
+@test "migrate：.claude/、.agents/ 下指进工作区的软链（local-* skill）一起改，相对链接保持相对" {
+  init_repo "$P"
+  git -C "$P" commit -q --allow-empty -m init
+  mg init "$P"
+  mkdir -p "$P/.margin/skills/local-x" "$P/.claude/skills" "$P/.agents/skills"
+  ln -s ../../.margin/skills/local-x "$P/.claude/skills/local-x"
+  ln -s "$P/.margin/skills/local-x" "$P/.agents/skills/local-x"
+  ln -s /tmp "$P/.claude/skills/not-ours"
+  git -C "$P" worktree add -q "$BATS_TEST_TMPDIR/wt"
+  local wt
+  wt=$(cd "$BATS_TEST_TMPDIR/wt" && pwd -P)
+  mg init "$wt" >/dev/null
+  mkdir -p "$wt/.claude/skills" && ln -s ../../.margin/skills/local-x "$wt/.claude/skills/local-x"
+  run mg migrate --to .notes --dry-run "$P"
+  has "[PLAN] 软链 .claude/skills/local-x → ../../.notes/skills/local-x"
+  [ "$(readlink "$P/.claude/skills/local-x")" = ../../.margin/skills/local-x ]
+  run mg migrate --to .notes "$P"
+  [ "$status" -eq 0 ]
+  [ "$(readlink "$P/.claude/skills/local-x")" = ../../.notes/skills/local-x ]
+  [ "$(readlink "$P/.agents/skills/local-x")" = "$P/.notes/skills/local-x" ]
+  [ "$(readlink "$P/.claude/skills/not-ours")" = /tmp ]
+  [ "$(readlink "$wt/.claude/skills/local-x")" = ../../.notes/skills/local-x ]
+  [ -d "$wt/.claude/skills/local-x/" ]
+}
