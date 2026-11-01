@@ -138,6 +138,8 @@ marginalia migrate              # 改为当前默认目录名；--to <名字> �
 
 任务、经验等正文里写着的旧路径不会被改写，`migrate` 会把这些文件列出来，按需手动修改。迁移后本项目里正在运行的 agent 会话需要重启（auto memory 路径变了）。
 
+工作区里如果放了脚本，迁移前留意三类东西：启动时就记下绝对路径的常驻进程（tmux 里的循环任务等），迁移后要重启；脚本里写死的旧目录名（在上面的清单里）；Python venv 等把绝对路径写进 shebang 的环境，迁移后要重建（如 `uv sync`）。
+
 ## 在 trine 里使用
 
 [trine](https://github.com/smokecat/trine)（Claude Code 的自托管远程界面）可以加载 marginalia 的扩展：在会话页查看本项目的任务、把会话关联到任务、一键开新会话接续。扩展在 `integrations/trine/`，需要 trine agent 0.16.0 及以上，在 agent 所在的机器上注册：
