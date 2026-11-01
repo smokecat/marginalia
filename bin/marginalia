@@ -145,7 +145,7 @@ cmd_config() {
   fi
 
   if [ -z "$key" ] || [ $list = 1 ]; then
-    [ $unset = 0 ] && [ $have_value = 0 ] || die "用法：marginalia config <级别> [--unset] dir [名字]"
+    if [ $unset = 1 ] || [ $have_value = 1 ]; then die "用法：marginalia config <级别> [--unset] dir [名字]"; fi
     row() { printf '%-8s %-44s %s\n' "$1" "$2" "${3:-（未设置）}"; }
     row system "$SYSTEM_CONFIG" "$(conf_get "$SYSTEM_CONFIG")"
     row user "$USER_CONFIG" "$(conf_get "$USER_CONFIG")"
@@ -161,7 +161,7 @@ cmd_config() {
   fi
 
   if [ -z "$level" ]; then
-    [ $unset = 0 ] && [ $have_value = 0 ] || die "设置或删除时需要指定级别：--system | --user | --project"
+    if [ $unset = 1 ] || [ $have_value = 1 ]; then die "设置或删除时需要指定级别：--system | --user | --project"; fi
     if [ -n "$root" ]; then resolve_dir "$root"; else default_dir; fi
     echo "$D"; return
   fi
@@ -195,7 +195,7 @@ cmd_config() {
   fi
   if [ "$level" = system ]; then file=$SYSTEM_CONFIG; else file=$USER_CONFIG; fi
   if [ $unset = 1 ]; then
-    [ -f "$file" ] && git config -f "$file" --unset marginalia.dir || true
+    if [ -f "$file" ]; then git config -f "$file" --unset marginalia.dir || true; fi
     say REMOVED "$file marginalia.dir"
   else
     mkdir -p "$(dirname "$file")" 2>/dev/null || die "无法创建 $(dirname "$file")（系统级配置可能需要 sudo）"
