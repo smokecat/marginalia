@@ -237,13 +237,29 @@ def set_memory_dir(path, want, previous=""):
     cur = data.get("autoMemoryDirectory")
     if cur == want:
         return "SKIPPED"
-    ours = [previous] if previous else []
+    if cur is not None and not isinstance(cur, str):
+        return "CONFLICT 不是字符串，未修改"
+    norm = (cur or "").rstrip("/")
     names = {os.path.basename(os.path.dirname(want)), LEGACY_DIR}
-    if cur and cur not in ours and not any(cur.rstrip("/").endswith("/%s/memory" % n) for n in names):
+    if norm and norm not in (want.rstrip("/"), previous.rstrip("/")) and not any(norm.endswith("/%s/memory" % n) for n in names):
         return "CONFLICT 已指向 %s，未修改" % cur
     data["autoMemoryDirectory"] = want
     write(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
     return "FIXED 路径已更新" if cur else "CREATED"
+
+
+def spec_pristine(path, rel, template, prev):
+    """规范文件是否没被用户改过：与按旧目录名渲染的当前模板一致，或是已发布过的某个版本（known-specs）。"""
+    text = read(path)
+    if text == render(template, "-", "DIR=" + prev) + "\n":
+        return "yes"
+    if prev == LEGACY_DIR:
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        known = os.path.join(os.path.dirname(os.path.abspath(template)), "known-specs")
+        for line in read(known).splitlines():
+            if line.split() == [digest, rel]:
+                return "yes"
+    return "no"
 
 
 def exclude_rename(path, old, new):
@@ -297,6 +313,7 @@ COMMANDS = {
     "render": render,
     "set-memory-dir": set_memory_dir,
     "store-id": store_id,
+    "spec-pristine": spec_pristine,
     "exclude-rename": exclude_rename,
     "find-refs": find_refs,
     "realpath": os.path.realpath,

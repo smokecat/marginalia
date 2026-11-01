@@ -1,0 +1,3 @@
+# 历次发布过的规范文件（目录名为字面值）的 sha256：迁移时文件与其中之一一致，就视为用户没改过，随目录名一起更新
+09ceea6a1d2b27e24cc2270bded013555c26cab5ddab119d4a68c382f7479be8 README.md
+17a3237822fe0634906ecf3ea4f1d5171db58321bb8d62060901f2fd5783eb06 templates/task.md

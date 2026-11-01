@@ -132,8 +132,8 @@ lacks() { [[ "$output" != *"$1"* ]] || { echo "输出中不应有：$1"; echo "$
   git -C "$P/.margin" commit -qam "local edit"
   run mg init "$P"
   has "[ASK] .margin/README.md"
-  has "marginalia-README.md 查看"
-  [ -f "$P/.margin/tmp/marginalia-README.md" ]
+  has "tmp/marginalia-README-"
+  ls "$P/.margin/tmp/"marginalia-README-* >/dev/null
   run mg init --update-spec "$P"
   has "[UPDATED] .margin/README.md"
   has "[COMMITTED]"
@@ -477,6 +477,9 @@ legacy_project() {
   MARGINALIA_DIR=.local mg init "$P" >/dev/null
   git -C "$P" config --local --unset marginalia.dir
   git -C "$P/.local" config --local --unset marginalia.storeId
+  # 规范文件换成旧版 marginalia 实际写出的版本（known-specs 里登记过）
+  cp "$REPO/test/fixtures/legacy-README.md" "$P/.local/README.md"
+  git -C "$P/.local" commit -qam "legacy spec"
 }
 
 @test "config：系统 < 用户 < 环境变量 < 项目，--list 标出来源" {
@@ -538,6 +541,7 @@ legacy_project() {
   grep -q "\"$P/.notes/memory\"" "$P/.claude/settings.local.json"
   [ -z "$(git -C "$P" status --porcelain)" ]
   mg config --user dir .elsewhere
+  [ "$(cd "$P/.notes/tasks" && mg config dir)" = ".notes" ]
   cd "$P"
   run mg task new still-here
   [ "$status" -eq 0 ]
@@ -580,7 +584,6 @@ legacy_project() {
   run mg init "$P"
   [ "$status" -eq 0 ]
   has "marginalia migrate"
-  lacks "[ASK] .local/README.md"      # 规范文件按 .local 渲染，与旧版一致
   [ ! -e "$P/.margin" ]
   [ "$(git -C "$P" config marginalia.dir)" = ".local" ]
 }
@@ -626,6 +629,8 @@ legacy_project() {
   grep -qxF .margin "$P/.git/info/exclude"
   [ "$(grep -cxF .local "$P/.git/info/exclude")" = 0 ]
   [ ! -e "$wt/.local" ] && [ "$(readlink "$wt/.margin")" = "$P/.margin" ]
+  has "[UPDATED] .margin/README.md（目录名随迁移更新）"     # 旧版规范文件没被改过，随迁移更新
+  grep -q "^# .margin — 私有工作区" "$P/.margin/README.md"
   for r in "$P" "$wt"; do
     grep -q "私有工作区（.margin/）" "$r/CLAUDE.local.md"
     grep -q "\"$P/.margin/memory\"" "$r/.claude/settings.local.json"
@@ -703,4 +708,110 @@ legacy_project() {
   python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["badge"]["text"]=="进行中", d' "$output"
   run ext pick '{"op":"pick","point":"composerAction","context":{"cwd":"'"$P"'"},"args":{"query":"alp"}}'
   python3 -c 'import json,sys; i=json.loads(sys.argv[1])["items"]; assert i[0]["effects"][0]["text"]==".margin/tasks/alpha/README.md", i' "$output"
+}
+
+# ------------------------------------------------------------------ 边界情况
+
+@test "目录名校验：换行、空格、非 ASCII、大小写变体的保留名都拒绝" {
+  init_repo "$P"
+  cd "$P"
+  for bad in $'.notes\nbad' '.Git' '.GIT' '.CLAUDE' '.Agents' '笔记' 'a b'; do
+    run mg init --dir "$bad" "$P"
+    [ "$status" -ne 0 ]
+  done
+  [ ! -e "$P/.margin" ]
+}
+
+@test "配置文件损坏时报错，不静默回退" {
+  init_repo "$P"
+  cd "$P"
+  mkdir -p "$HOME/.marginalia" && printf '[marginalia\n\tdir = .x\n' > "$HOME/.marginalia/config"
+  run mg config dir
+  [ "$status" -ne 0 ]
+  has "无法读取配置文件"
+}
+
+@test "普通目录不会被当成工作区（任务不会被提交进主仓库）" {
+  init_repo "$P"
+  mkdir -p "$P/docs" && echo x > "$P/docs/a.md"
+  git -C "$P" add docs && git -C "$P" commit -qm docs
+  cd "$P"
+  run env MARGINALIA_DIR=docs "${MARGINALIA_TEST_BASH:-bash}" "$REPO/bin/marginalia" task new foo
+  [ "$status" -eq 5 ]
+  [ ! -e "$P/docs/tasks" ]
+  [ "$(git -C "$P" log --oneline | wc -l | tr -d ' ')" = 1 ]
+}
+
+@test "旧版 .local 项目：同名的普通默认目录不会遮住它" {
+  legacy_project
+  mkdir "$P/.margin"
+  cd "$P"
+  run mg task list
+  [ "$status" -eq 0 ]
+  run mg config dir
+  [ "$output" = ".local" ]
+}
+
+@test "migrate：worktree 的软链指向别处或有独立目录时整体拒绝，不动任何东西" {
+  init_repo "$P"
+  git -C "$P" commit -q --allow-empty -m init
+  mg init "$P"
+  git -C "$P" worktree add -q "$BATS_TEST_TMPDIR/wt"
+  local wt
+  wt=$(cd "$BATS_TEST_TMPDIR/wt" && pwd -P)
+  mkdir -p "$BATS_TEST_TMPDIR/other"
+  ln -s "$BATS_TEST_TMPDIR/other" "$wt/.margin"
+  run mg migrate --to .notes "$P"
+  [ "$status" -ne 0 ]
+  has "[CONFLICT] $wt/.margin 是指向"
+  [ -d "$P/.margin" ] && [ ! -e "$P/.notes" ] && [ -L "$wt/.margin" ]
+  grep -qxF .margin "$P/.git/info/exclude"
+  rm "$wt/.margin" && mkdir "$wt/.margin"
+  run mg migrate --to .notes "$P"
+  [ "$status" -ne 0 ]
+  has "独立目录"
+  [ -d "$P/.margin" ]
+}
+
+@test "migrate：worktree 里入口文件受版本控制时拒绝" {
+  init_repo "$P"
+  git -C "$P" commit -q --allow-empty -m init
+  mg init "$P"
+  git -C "$P" worktree add -q -b other "$BATS_TEST_TMPDIR/wt"
+  local wt
+  wt=$(cd "$BATS_TEST_TMPDIR/wt" && pwd -P)
+  echo shared > "$wt/CLAUDE.local.md"
+  git -C "$wt" add -f CLAUDE.local.md && git -C "$wt" commit -qm tracked
+  run mg migrate --to .notes "$P"
+  [ "$status" -ne 0 ]
+  has "受版本控制"
+  [ "$(cat "$wt/CLAUDE.local.md")" = shared ]
+  [ -d "$P/.margin" ]
+}
+
+@test "migrate：钉住新名之后才中断（如 commit 失败），重跑能把剩余步骤做完" {
+  init_repo "$P"
+  mg init "$P"
+  # 模拟：目录已移动、项目配置已改成新名、标记还在，但托管块和 settings 没更新
+  mv "$P/.margin" "$P/.notes"
+  git -C "$P" config marginalia.dir .notes
+  git -C "$P" config marginalia.migrateFrom .margin
+  git -C "$P" config marginalia.migrateTo .notes
+  run mg migrate "$P"
+  [ "$status" -eq 0 ]
+  has "继续上次未完成的迁移"
+  grep -q "私有工作区（.notes/）" "$P/CLAUDE.local.md"
+  grep -q "\"$P/.notes/memory\"" "$P/.claude/settings.local.json"
+  [ -z "$(git -C "$P" config --get marginalia.migrateFrom)" ]
+  run mg migrate --to .notes "$P"
+  has "无需迁移"
+}
+
+@test "migrate：旧 memory 路径带尾斜杠也能更新" {
+  init_repo "$P"
+  mg init --dir .notes "$P"
+  printf '{"autoMemoryDirectory":"%s/.notes/memory/"}\n' "$P" > "$P/.claude/settings.local.json"
+  run mg migrate --to .margin "$P"
+  [ "$status" -eq 0 ]
+  grep -q "\"$P/.margin/memory\"" "$P/.claude/settings.local.json"
 }
