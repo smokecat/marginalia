@@ -5,13 +5,13 @@ setup() {
   REPO=$(cd "$BATS_TEST_DIRNAME/.." && pwd -P)
   # 隔离 HOME 与 git 全局配置，测试不读写真实环境
   export HOME="$BATS_TEST_TMPDIR/home"
-  mkdir -p "$HOME"
+  mkdir -p "$HOME/.claude"  # 默认只装了 Claude Code；测 Codex / Gemini 的用例自己建配置目录
   export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$HOME/.gitconfig"
   git config --global user.name test
   git config --global user.email test@example.com
   git config --global init.defaultBranch main
   git config --global commit.gpgsign false
-  unset CLAUDE_CONFIG_DIR CODEX_HOME MARGINALIA_DIR MARGINALIA_USER_CONFIG
+  unset CLAUDE_CONFIG_DIR CODEX_HOME GEMINI_CLI_HOME MARGINALIA_DIR MARGINALIA_USER_CONFIG
   export MARGINALIA_SYSTEM_CONFIG="$BATS_TEST_TMPDIR/etc/marginalia/config"
   mkdir -p "$BATS_TEST_TMPDIR/proj"
   P=$(cd "$BATS_TEST_TMPDIR/proj" && pwd -P)
@@ -448,7 +448,7 @@ PY
 
 @test "setup：遵守 CODEX_HOME 与 CLAUDE_CONFIG_DIR" {
   export CODEX_HOME="$BATS_TEST_TMPDIR/codex" CLAUDE_CONFIG_DIR="$BATS_TEST_TMPDIR/claude"
-  mkdir -p "$CODEX_HOME"
+  mkdir -p "$CODEX_HOME" "$CLAUDE_CONFIG_DIR"
   mg setup
   [ -L "$CLAUDE_CONFIG_DIR/skills/marginalia-task" ]
   grep -q "marginalia:start" "$CODEX_HOME/AGENTS.md"

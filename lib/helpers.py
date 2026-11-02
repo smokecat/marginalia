@@ -217,6 +217,124 @@ def render(template, dest, *pairs):
     return ""
 
 
+MEMORY_MAX_LINES = 200  # 与 Claude Code 加载 MEMORY.md 的上限一致
+
+
+def context(local, core):
+    """`marginalia context`：核心约定（core 模板按工作区目录名渲染）+ 活跃任务 + 经验索引，供 hook 注入或手动查看。"""
+    name = os.path.basename(local)
+    out = [render(core, "-", "DIR=" + name)]
+    rows = []
+    for t in json.loads(tasks_json(local))["tasks"]:
+        if t["status"] == "done":
+            continue
+        line = "- `%s`（%s）%s" % (t["slug"], t["status"], t["title"])
+        for key, label in (("state", "当前状态"), ("next", "下一步")):
+            if t["resume"][key]:
+                line += "\n  - %s：%s" % (label, t["resume"][key])
+        rows.append(line)
+    out.append("## 活跃任务（%s/tasks/）\n\n%s" % (name, "\n".join(rows) if rows else "（没有）"))
+    mem = os.path.join(local, "memory", "MEMORY.md")
+    lines = read(mem).strip("\n").split("\n") if os.path.isfile(mem) else []
+    if lines and lines[0].startswith("# "):
+        lines = lines[1:]
+    lines = [l for l in lines if l.strip()]
+    if len(lines) > MEMORY_MAX_LINES:
+        lines = lines[:MEMORY_MAX_LINES] + ["…（其余见 %s/memory/MEMORY.md）" % name]
+    out.append("## 经验索引（%s/memory/MEMORY.md）\n\n%s" % (name, "\n".join(lines) if lines else "（暂无）"))
+    return "\n\n".join(out)
+
+
+HOOK_MARK = "marginalia hook session-start"  # 命令里带这一段的 hook 视为 marginalia 的
+# 各 agent hook 的超时单位不同：Codex 是秒，Gemini 是毫秒
+HOOK_TIMEOUT = {"codex": 10, "gemini": 10000}
+
+
+def load_json(path):
+    """读 JSON 配置文件（不存在时为空对象），无法解析或顶层不是对象时返回 None。"""
+    if not os.path.exists(path):
+        return {}
+    try:
+        data = json.loads(read(path) or "{}")
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def ours(group):
+    return isinstance(group, dict) and any(isinstance(h, dict) and HOOK_MARK in str(h.get("command", ""))
+                                           for h in group.get("hooks") or [])
+
+
+def set_hook(agent, path, command):
+    """在 agent 的配置文件里写入（或更新）marginalia 的 SessionStart hook，其他内容不动。"""
+    data = load_json(path)
+    if data is None:
+        return "CONFLICT 无法解析或顶层不是对象，未修改"
+    hooks = data.setdefault("hooks", {})
+    if not isinstance(hooks, dict) or not isinstance(hooks.get("SessionStart", []), list):
+        return "CONFLICT hooks 结构不认识，未修改"
+    handler = {"type": "command", "command": command, "timeout": HOOK_TIMEOUT[agent]}
+    if agent == "gemini":
+        handler["name"] = "marginalia"
+    want = {"hooks": [handler]}
+    groups = hooks.setdefault("SessionStart", [])
+    mine = [i for i, g in enumerate(groups) if ours(g)]
+    if [groups[i] for i in mine] == [want]:
+        return "SKIPPED"
+    state = "UPDATED" if mine else "CREATED"
+    if mine:
+        groups[mine[0]] = want  # 原位替换：Codex 按组序号记审核状态
+        for i in reversed(mine[1:]):
+            del groups[i]
+    else:
+        groups.append(want)
+    write(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    return state
+
+
+def remove_hook(path):
+    """删除 marginalia 的 SessionStart hook；SessionStart / hooks 因此变空时一并删掉，文件只剩空对象时删文件。"""
+    data = load_json(path)
+    if not data:
+        return "SKIPPED"
+    hooks = data.get("hooks")
+    if not isinstance(hooks, dict) or not isinstance(hooks.get("SessionStart"), list):
+        return "SKIPPED"
+    groups = [g for g in hooks["SessionStart"] if not ours(g)]
+    if len(groups) == len(hooks["SessionStart"]):
+        return "SKIPPED"
+    if groups:
+        hooks["SessionStart"] = groups
+    else:
+        del hooks["SessionStart"]
+        if not hooks:
+            del data["hooks"]
+    if not data:
+        os.remove(path)
+        return "DELETED"
+    write(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    return "REMOVED"
+
+
+def hook_input_cwd():
+    """从 stdin 的 hook 输入（JSON）里取会话目录；读不到时为空。"""
+    try:
+        data = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        return ""
+    cwd = data.get("cwd") if isinstance(data, dict) else None
+    return cwd if isinstance(cwd, str) else ""
+
+
+def hook_output():
+    """SessionStart hook 的输出（注入文本从 stdin 读）：Codex 和 Gemini 都认 hookSpecificOutput.additionalContext（Gemini 只认 JSON）。"""
+    text = sys.stdin.read().strip("\n")
+    if not text:
+        return ""
+    return json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}}, ensure_ascii=False)
+
+
 LEGACY_DIR = ".local"
 
 
@@ -347,6 +465,11 @@ COMMANDS = {
     "find-refs": find_refs,
     "relink": relink,
     "realpath": os.path.realpath,
+    "context": context,
+    "set-hook": set_hook,
+    "remove-hook": remove_hook,
+    "hook-input-cwd": hook_input_cwd,
+    "hook-output": hook_output,
 }
 
 if __name__ == "__main__":

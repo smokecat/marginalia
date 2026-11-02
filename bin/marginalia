@@ -10,9 +10,9 @@ VERSION=$(cat "$MARGINALIA_HOME/VERSION")
 TODAY=$(date +%F)
 STATUSES="active paused blocked done"
 PREV_DIR=""  # migrate 刚把工作区从这个名字改走（init 据此自动更新未改动过的规范文件）
-SKILL_DIRS="$HOME/.agents/skills ${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills"
+SHARED_SKILLS="$HOME/.agents/skills"  # Agent Skills 的跨工具目录，多数 agent 直接读这里
 BIN_DIR="$HOME/.local/bin"
-GLOBAL_ENTRIES="${CODEX_HOME:-$HOME/.codex}/AGENTS.md $HOME/.gemini/GEMINI.md"
+KNOWN_AGENTS="claude codex gemini"
 BUILTIN_DIR=.margin
 LEGACY_DIR=.local
 SYSTEM_CONFIG=${MARGINALIA_SYSTEM_CONFIG:-/etc/marginalia/config}
@@ -37,9 +37,11 @@ usage() {
       --migrate-memory                   把 Claude 默认 auto memory 复制进工作区的 memory/
   marginalia migrate [--to <名字>] [--dry-run] [目录]
                                          把已有工作区改名（默认改为当前默认目录名，如旧版 .local → .margin）
-  marginalia config [--list]             各级配置与生效的目录名
+  marginalia config [--list]             各级配置、生效的目录名与启用的 agent
   marginalia config [级别] dir [名字]    读取/设置目录名；级别：--system | --user | --project
-  marginalia config <级别> --unset dir   删除该级别的设置
+  marginalia config [级别] agents [列表] 读取/设置启用的 agent（如 claude,codex；auto = 已安装的）；级别：--system | --user
+  marginalia config <级别> --unset <键>  删除该级别的设置
+  marginalia context [目录]              输出本项目的核心约定、活跃任务和经验索引（hook 注入的内容）
   marginalia task new <slug> [标题]      新建任务
   marginalia task list [--json] [--archived]   列出未归档任务（--json 输出机器可读结果，--archived 含已归档）
   marginalia task show <slug> --json     单个任务的详情（含接续指引），机器可读
@@ -50,6 +52,7 @@ usage() {
 目录名优先级（高 → 低）：项目（.git/config 的 marginalia.dir）> 环境变量 MARGINALIA_DIR
 > 用户（~/.marginalia/config）> 系统（/etc/marginalia/config）> 内置 .margin。
 init 会把实际使用的目录名写进项目配置，之后改默认值不影响已有项目。
+支持的 agent：claude codex gemini；默认启用已安装的（配置目录存在）。
 
 输出中的 [ASK] 表示需要用户决定，[CONFLICT] 表示未自动处理的冲突。
 EOF
@@ -137,7 +140,8 @@ cmd_config() {
       *) if [ -z "$key" ]; then key=$a; else value=$a; have_value=1; fi ;;
     esac
   done
-  [ -z "$key" ] || [ "$key" = dir ] || die "未知配置项：${key}（目前只有 dir）"
+  [ -z "$key" ] || [ "$key" = dir ] || [ "$key" = agents ] || die "未知配置项：${key}（可选 dir、agents）"
+  if [ "$key" = agents ] && [ $list = 0 ]; then config_agents "$level" "$unset" "$have_value" "$value"; return; fi
   root=$(git rev-parse --show-toplevel 2>/dev/null || true)
   if [ -n "$root" ]; then
     if r=$(inside_ws "$root"); then root=$r; fi
@@ -157,6 +161,11 @@ cmd_config() {
       row project "（不在 git 项目中）" ""
     fi
     default_dir; echo "新项目默认：${D}（${D_SRC}）"
+    echo
+    row system "$SYSTEM_CONFIG" "$(agents_conf "$SYSTEM_CONFIG")"
+    row user "$USER_CONFIG" "$(agents_conf "$USER_CONFIG")"
+    enabled_agents
+    echo "启用的 agent：${ENABLED:-（无）}（$( [ "$AGENTS_SRC" = auto ] && echo 自动检测已安装的 || echo "$AGENTS_SRC")）"
     return
   fi
 
@@ -205,9 +214,98 @@ cmd_config() {
   say INFO "只影响之后新初始化的项目；Codex / Gemini 的全局入口按默认目录名生成，重跑 marginalia setup 更新"
 }
 
+config_agents() { # <级别> <是否 unset> <是否给了值> <值>
+  local level=$1 unset=$2 have=$3 value=$4 file
+  case $level in
+    "") [ "$unset" = 0 ] && [ "$have" = 0 ] || die "设置或删除时需要指定级别：--system | --user"
+        enabled_agents; echo "$ENABLED"; return ;;
+    project) die "agents 只能在 --system 或 --user 级别设置" ;;
+    system) file=$SYSTEM_CONFIG ;;
+    user) file=$USER_CONFIG ;;
+  esac
+  if [ "$unset" = 0 ] && [ "$have" = 0 ]; then agents_conf "$file"; echo; return; fi
+  [ "$unset" = 0 ] || [ "$have" = 0 ] || die "--unset 不需要值"
+  if [ "$unset" = 1 ]; then
+    if [ -f "$file" ]; then git config -f "$file" --unset marginalia.agents || true; fi
+    say REMOVED "$file marginalia.agents"
+  else
+    valid_agents "$value" || die "agents 不合法：${value}（auto，或逗号分隔的 ${KNOWN_AGENTS}）"
+    mkdir -p "$(dirname "$file")" 2>/dev/null || die "无法创建 $(dirname "$file")（系统级配置可能需要 sudo）"
+    git config -f "$file" marginalia.agents "$value" || die "无法写入 ${file}（系统级配置可能需要 sudo）"
+    say UPDATED "$file marginalia.agents = $value"
+  fi
+  say INFO "重跑 marginalia setup 生效（未启用的 agent 的全局入口和 hook 会被撤掉）；已有项目的入口在重跑 init 时更新"
+}
+
 main_root() { # <工作树根>：主工作区根（worktree 时不同）
   dirname "$(git -C "$1" rev-parse --path-format=absolute --git-common-dir)"
 }
+
+# ---------------------------------------------------------------- agent 适配器
+
+# 每个 agent 的接入点。加一个 agent：登记进 KNOWN_AGENTS，在下面各函数里补上它的分支（没有的能力留空）
+agent_home() { # <agent>：配置目录（遵守各工具的环境变量），存在即视为已安装
+  case $1 in
+    claude) echo "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" ;;
+    codex) echo "${CODEX_HOME:-$HOME/.codex}" ;;
+    gemini) echo "${GEMINI_CLI_HOME:-$HOME}/.gemini" ;;
+  esac
+}
+agent_skills() { # <agent>：不读 ~/.agents/skills、需要另外软链 skills 的目录
+  case $1 in
+    claude) echo "$(agent_home claude)/skills" ;;
+  esac
+}
+agent_global() { # <agent>：全局入口文件（写托管块；hook 不生效时的兜底）
+  case $1 in
+    codex) echo "$(agent_home codex)/AGENTS.md" ;;
+    gemini) echo "$(agent_home gemini)/GEMINI.md" ;;
+  esac
+}
+agent_hook() { # <agent>：写 SessionStart hook 的配置文件（hook 调用 marginalia hook session-start <agent>）
+  case $1 in
+    codex) echo "$(agent_home codex)/hooks.json" ;;
+    gemini) echo "$(agent_home gemini)/settings.json" ;;
+  esac
+}
+agent_project() { # <agent>：项目级入口的实现（init 在每个工作树里调用）；没有的为空
+  case $1 in
+    claude) echo claude_project ;;
+  esac
+}
+
+# 启用的 agent：用户 > 系统配置的 marginalia.agents（逗号或空格分隔）；未设置或 auto 时为已安装的
+agents_conf() { # <配置文件>
+  [ -e "$1" ] || return 0
+  local v rc=0
+  v=$(git config -f "$1" --get marginalia.agents) || rc=$?
+  [ $rc -le 1 ] || die "无法读取配置文件 $1（git config 退出码 ${rc}）"
+  printf '%s' "$v"
+}
+valid_agents() { # <列表>：auto，或若干个已知 agent
+  local a
+  [ "$1" = auto ] && return 0
+  [ -n "$(printf '%s' "$1" | tr -d ', ')" ] || return 1
+  for a in $(printf '%s' "$1" | tr ',' ' '); do
+    case " $KNOWN_AGENTS " in *" $a "*) ;; *) return 1 ;; esac
+  done
+}
+enabled_agents() { # 结果放在 ENABLED（空格分隔）和 AGENTS_SRC（auto / 配置文件）
+  local v a out=""
+  v=$(agents_conf "$USER_CONFIG"); AGENTS_SRC=$USER_CONFIG
+  if [ -z "$v" ]; then v=$(agents_conf "$SYSTEM_CONFIG"); AGENTS_SRC=$SYSTEM_CONFIG; fi
+  if [ -z "$v" ] || [ "$v" = auto ]; then
+    AGENTS_SRC=auto
+    for a in $KNOWN_AGENTS; do [ ! -d "$(agent_home "$a")" ] || out="$out $a"; done
+  else
+    valid_agents "$v" || die "marginalia.agents 不合法：${v}（来自 ${AGENTS_SRC}；可选 auto 或 ${KNOWN_AGENTS}）"
+    for a in $KNOWN_AGENTS; do
+      case " $(printf '%s' "$v" | tr ',' ' ') " in *" $a "*) out="$out $a" ;; esac
+    done
+  fi
+  ENABLED=${out# }
+}
+is_enabled() { case " $ENABLED " in *" $1 "*) return 0 ;; esac; return 1; }
 
 # ---------------------------------------------------------------- setup / uninstall
 
@@ -228,36 +326,98 @@ unlink_ours() { # <dst> <src>：只删除指向本仓库的软链
   if [ -L "$1" ] && [ "$(readlink "$1")" = "$2" ]; then rm "$1"; say REMOVED "$1"; fi
 }
 
+HOOK_CMD="$BIN_DIR/marginalia hook session-start"  # 写进各 agent 配置的命令；改动会让 Codex 要求重新审核
+
 cmd_setup() {
-  local s dir f
+  local s a f dir seen="" rp
+  enabled_agents
+  say INFO "启用的 agent：${ENABLED:-（无）}（$( [ "$AGENTS_SRC" = auto ] && echo 已安装的 || echo "$AGENTS_SRC")；marginalia config agents 可改）"
   for s in "$MARGINALIA_HOME"/skills/*/; do
     s=${s%/}
-    for dir in $SKILL_DIRS; do link "$s" "$dir/$(basename "$s")"; done
+    link "$s" "$SHARED_SKILLS/$(basename "$s")"
+    for a in $KNOWN_AGENTS; do
+      dir=$(agent_skills "$a"); [ -n "$dir" ] || continue
+      if is_enabled "$a"; then link "$s" "$dir/$(basename "$s")"; else unlink_ours "$dir/$(basename "$s")" "$s"; fi
+    done
   done
   link "$SELF" "$BIN_DIR/marginalia"
   case ":$PATH:" in *":$BIN_DIR:"*) ;; *) say WARN "$BIN_DIR 不在 PATH 中" ;; esac
 
   default_dir
-  for f in $GLOBAL_ENTRIES; do
-    if [ -d "$(dirname "$f")" ]; then
-      say "$(helper upsert-block "$f" "$(helper render "$TPL/agent-global-block.md" - "DIR=$D")")" "$f 全局入口"
-    else
-      say SKIPPED "$(dirname "$f") 不存在（对应工具未安装，装好后重跑 setup）"
+  # 启用的 agent 的全局入口（真实路径）：软链到同一份文件的未启用 agent 不能把它删掉
+  local keep=""
+  for a in $ENABLED; do
+    f=$(agent_global "$a"); [ -z "$f" ] || keep="$keep $(helper realpath "$f")"
+  done
+  for a in $KNOWN_AGENTS; do
+    if ! is_enabled "$a"; then
+      # 未启用：撤掉以前写过的入口（没写过就什么都不做）
+      f=$(agent_global "$a")
+      if [ -n "$f" ] && [ -e "$f" ]; then
+        case " $keep " in
+          *" $(helper realpath "$f") "*) ;;
+          *) [ "$(helper remove-block "$f")" = SKIPPED ] || say REMOVED "$f 全局入口（$a 未启用）" ;;
+        esac
+      fi
+      f=$(agent_hook "$a"); [ -z "$f" ] || [ "$(helper remove-hook "$f")" = SKIPPED ] || say REMOVED "$f SessionStart hook（$a 未启用）"
+      continue
+    fi
+    if [ ! -d "$(agent_home "$a")" ]; then
+      say SKIPPED "$(agent_home "$a") 不存在（$a 未安装，装好后重跑 setup）"; continue
+    fi
+    f=$(agent_global "$a")
+    if [ -n "$f" ]; then
+      # 多个工具的全局入口软链到同一份文件时只写一次
+      rp=$(helper realpath "$f")
+      case " $seen " in
+        *" $rp "*) say SKIPPED "$f 全局入口（与前面的同一文件）" ;;
+        *) seen="$seen $rp"; say "$(helper upsert-block "$f" "$(helper render "$TPL/agent-global-block.md" - "DIR=$D")")" "$f 全局入口" ;;
+      esac
+    fi
+    f=$(agent_hook "$a")
+    if [ -n "$f" ]; then
+      say "$(helper set-hook "$a" "$f" "$HOOK_CMD $a")" "$f SessionStart hook"
+      [ "$a" != codex ] || say INFO "Codex 首次启动时会提示审核新的 hook（Hooks need review），确认后生效；codex exec 里未审核的 hook 不会运行"
+      [ "$a" != gemini ] || say INFO "Gemini 只在受信任的文件夹里运行 hook"
     fi
   done
 }
 
 cmd_uninstall() {
-  local s dir f
+  local s a f dir
   for s in "$MARGINALIA_HOME"/skills/*/; do
     s=${s%/}
-    for dir in $SKILL_DIRS; do unlink_ours "$dir/$(basename "$s")" "$s"; done
+    unlink_ours "$SHARED_SKILLS/$(basename "$s")" "$s"
+    for a in $KNOWN_AGENTS; do
+      dir=$(agent_skills "$a"); [ -z "$dir" ] || unlink_ours "$dir/$(basename "$s")" "$s"
+    done
   done
   unlink_ours "$BIN_DIR/marginalia" "$SELF"
-  for f in $GLOBAL_ENTRIES; do
-    say "$(helper remove-block "$f")" "$f 全局入口"
+  for a in $KNOWN_AGENTS; do
+    f=$(agent_global "$a"); [ -z "$f" ] || say "$(helper remove-block "$f")" "$f 全局入口"
+    f=$(agent_hook "$a"); [ -z "$f" ] || say "$(helper remove-hook "$f")" "$f SessionStart hook"
   done
   say INFO "项目内的私有工作区、CLAUDE.local.md 托管块等未改动"
+}
+
+# ---------------------------------------------------------------- context / hook
+
+cmd_context() { # [目录]
+  [ $# -le 1 ] || die "用法：marginalia context [目录]"
+  if [ -n "${1:-}" ]; then cd "$1" 2>/dev/null || die "目录不存在：$1"; fi
+  local L
+  find_local
+  helper context "$L" "$TPL/entry-core.md"
+}
+
+# 由各 agent 的 SessionStart hook 调用：stdin 是 hook 输入（取其中的 cwd），输出注入上下文的 JSON。
+# 不在有工作区的项目里、或出了任何错，都静默退出 0，不打断会话
+cmd_hook() { # session-start <agent>
+  [ "${1:-}" = session-start ] || exit 0
+  local cwd text
+  cwd=$(helper hook-input-cwd 2>/dev/null) || cwd=""
+  text=$(cmd_context "${cwd:-$PWD}" 2>/dev/null) || exit 0
+  printf '%s\n' "$text" | helper hook-output 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------- init
@@ -299,7 +459,7 @@ claude_entry() { # <工作树根> <是否 --create-claude-md>
   elif [ $has_agents = 1 ] && [ $imports = 0 ]; then
     say WARN "CLAUDE.md 没有 import AGENTS.md，Claude 不会读 AGENTS.md；建议在 CLAUDE.md 中加一行 @AGENTS.md"
   fi
-  block=$(helper render "$TPL/claude-local-block.md" - "DIR=$D")
+  block=$(helper render "$TPL/claude-local-block.md" - "CORE=$(cat "$TPL/entry-core.md")" "DIR=$D")
   # 项目没有 CLAUDE.md 时，CLAUDE.local.md 的存在会让 Claude 不读 AGENTS.md，这里 import 兜底（文件不存在时会被静默跳过）
   if [ $has_claude = 0 ]; then block="$block
 
@@ -313,6 +473,35 @@ memory_entry() { # <工作树根> <memory 绝对路径> [旧路径]
   mkdir -p "$1/.claude"
   r=$(helper set-memory-dir "$1/.claude/settings.local.json" "$2" "${3:-}")
   say "${r%% *}" ".claude/settings.local.json autoMemoryDirectory → $2${r#"${r%% *}"}"
+}
+
+# Claude Code 的项目级入口：CLAUDE.local.md 托管块、auto memory 指向工作区、迁移原有 auto memory
+# 用到 cmd_init 里的 MAIN、L、create_claude、migrate，并往 changed 里追加
+claude_project_present() { grep -qF '<!-- marginalia:start -->' "$1/CLAUDE.local.md" 2>/dev/null; }
+claude_project() { # <工作树根>
+  local root=$1 old base f
+  claude_entry "$root" "$create_claude"
+  memory_entry "$root" "$L/memory"
+  # 原有 auto memory 的目录名由主工作区路径中的非字母数字字符替换为 - 得到
+  old="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/$(printf '%s' "$MAIN" | sed 's/[^A-Za-z0-9]/-/g')/memory"
+  if [ -d "$old" ] && [ -n "$(ls -A "$old")" ]; then
+    if [ "$migrate" = 1 ]; then
+      for f in "$old"/*; do
+        base=$(basename "$f")
+        if [ "$base" = MEMORY.md ] && cmp -s "$L/memory/MEMORY.md" "$TPL/local/MEMORY.md"; then
+          cp "$f" "$L/memory/MEMORY.md"
+        elif [ -e "$L/memory/$base" ]; then
+          say WARN "memory/$base 已存在，未覆盖（旧文件：${f}）"; continue
+        else
+          cp -R "$f" "$L/memory/"
+        fi
+        changed="$changed memory/$base"
+      done
+      say MIGRATED "$old → $D/memory/（原目录保留，确认无误后可删除）"
+    else
+      say ASK "Claude 默认 auto memory 目录有内容：${old}；迁移进 $D/memory/ 加 --migrate-memory"
+    fi
+  fi
 }
 
 cmd_init() {
@@ -343,7 +532,7 @@ cmd_init() {
     say ASK "$dir 不是 git 仓库，私有排除依赖 git。确认要在这里初始化后，加 --git-init 重跑"
     exit 3
   fi
-  local MAIN L changed="" d f def
+  local MAIN L changed="" d f def a
   MAIN=$(main_root "$ROOT")
   resolve_dir "$MAIN"
   if [ -n "$want" ] && [ "$want" != "$D" ]; then
@@ -417,35 +606,18 @@ cmd_init() {
   tracked=$(git -C "$ROOT" ls-files -- "$D" CLAUDE.local.md .claude/settings.local.json | tr '\n' ' ')
   [ -z "$tracked" ] || say CONFLICT "以下私有路径已被主仓库跟踪，exclude 对它们不生效（未擅自 git rm --cached）：$tracked"
 
-  # 3. CLAUDE.md / AGENTS.md / CLAUDE.local.md
-  claude_entry "$ROOT" "$create_claude"
-
-  # 4. Claude auto memory 指向工作区的 memory/
-  memory_entry "$ROOT" "$L/memory"
-
-  # 5. 迁移 Claude 默认 auto memory（目录名由主工作区路径中的非字母数字字符替换为 - 得到）
-  local old base
-  old="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/$(printf '%s' "$MAIN" | sed 's/[^A-Za-z0-9]/-/g')/memory"
-  if [ -d "$old" ] && [ -n "$(ls -A "$old")" ]; then
-    if [ $migrate = 1 ]; then
-      for f in "$old"/*; do
-        base=$(basename "$f")
-        if [ "$base" = MEMORY.md ] && cmp -s "$L/memory/MEMORY.md" "$TPL/local/MEMORY.md"; then
-          cp "$f" "$L/memory/MEMORY.md"
-        elif [ -e "$L/memory/$base" ]; then
-          say WARN "memory/$base 已存在，未覆盖（旧文件：${f}）"; continue
-        else
-          cp -R "$f" "$L/memory/"
-        fi
-        changed="$changed memory/$base"
-      done
-      say MIGRATED "$old → $D/memory/（原目录保留，确认无误后可删除）"
+  # 3. 各 agent 的项目级入口：启用的 agent，或以前已经落地过（入口还在就继续维护）
+  enabled_agents
+  for a in $KNOWN_AGENTS; do
+    f=$(agent_project "$a"); [ -n "$f" ] || continue
+    if is_enabled "$a" || "${f}_present" "$ROOT"; then
+      "$f" "$ROOT"
     else
-      say ASK "Claude 默认 auto memory 目录有内容：${old}；迁移进 $D/memory/ 加 --migrate-memory"
+      say SKIPPED "$a 未启用，不写它的项目级入口"
     fi
-  fi
+  done
 
-  # 6. commit 本次在工作区中的变更
+  # 4. commit 本次在工作区中的变更
   # shellcheck disable=SC2086  # changed 是空格分隔的相对路径列表，均不含空格
   [ -z "$changed" ] || lcommit "$L" "chore: marginalia init" $changed
 
@@ -596,14 +768,14 @@ WTS
     fi
     say INFO "worktree：$wt"
     if grep -qF '<!-- marginalia:start -->' "$wt/CLAUDE.local.md" 2>/dev/null; then claude_entry "$wt" 0; fi
-    memory_entry "$wt" "$L/memory" "$OLD/memory"
+    [ ! -e "$wt/.claude/settings.local.json" ] || memory_entry "$wt" "$L/memory" "$OLD/memory"
     relinks "$wt" "$wt/$from" "$wt/$to"
     relinks "$wt" "$OLD" "$L"
   done <<WTS
 $wts
 WTS
   say INFO "主工作区：$MAIN"
-  memory_entry "$MAIN" "$L/memory" "$OLD/memory"
+  [ ! -e "$MAIN/.claude/settings.local.json" ] || memory_entry "$MAIN" "$L/memory" "$OLD/memory"
   relinks "$MAIN" "$OLD" "$L"
   # 主工作区其余部分（托管块、规范文件等）交给 init；init 失败（如 commit 失败）时标记保留，重跑继续
   PREV_DIR=$from
@@ -765,6 +937,8 @@ case ${1:-} in
   init) shift; cmd_init "$@" ;;
   migrate) shift; cmd_migrate "$@" ;;
   config) shift; cmd_config "$@" ;;
+  context) shift; cmd_context "$@" ;;
+  hook) shift; cmd_hook "$@" ;;
   task) shift; cmd_task "$@" ;;
   -V|--version|version) echo "marginalia $VERSION" ;;
   -h|--help|help|"") usage ;;

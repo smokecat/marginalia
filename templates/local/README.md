@@ -36,7 +36,7 @@
 存放下次能省时间的持久经验：项目怪癖、踩坑正解、已验证的用户偏好。一次性偶发错误、常识、代码库本身已记录的事实不记。
 
 - 结构：`MEMORY.md` 是索引，每条一行 `- [标题](file.md) — 一句话`；每条经验一个文件，带 frontmatter（`name` 用 kebab-case 短名，与文件名一致；`description`；`metadata.type`: user | feedback | project | reference）
-- Claude Code 的 auto memory 已指向本目录，会自动维护；其他 agent 开工前读 `MEMORY.md`，按需读具体条目，写入时遵循同样的结构
+- Claude Code 的 auto memory 已指向本目录，会自动维护；其他 agent 开工前读 `MEMORY.md`（Codex、Gemini CLI 会在会话开头自动注入索引），按需读具体条目，写入时遵循同样的结构
 - 有新认识时更新旧条目，不另起一条；被证伪的删除
 
 ## ops 记录
@@ -50,6 +50,18 @@
 - 结果：
 - 回滚：（如何撤销）
 ```
+
+## 决策
+
+有客观正确答案的直接做；有多个合理选项的，选定后在任务 README 的「决策」里留痕，不阻塞；推翻用户已明确表达的方向时必须先问。
+
+## 私有边界
+
+本目录、各 agent 的本地私有文件（`CLAUDE.local.md`、`.claude/settings.local.json` 等），以及 `.claude/`、`.agents/` 下 `local-` 前缀的私有扩展（skill、command、rule），都只在本机：永不进入主仓库或对外产物。
+
+## 上下文注入
+
+`marginalia context` 输出本项目的核心约定、活跃任务和经验索引；Codex、Gemini CLI 经 `marginalia setup` 安装的 SessionStart hook 在会话开头自动注入它。没有 hook 的 agent 可以手动运行。
 
 ## git
 
