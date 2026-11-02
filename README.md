@@ -173,13 +173,13 @@ trine-agent ext add <marginalia 目录>/integrations/trine
 
 ## 兼容性
 
-2026-10 的实测结果：
+2026-11 的实测结果：
 
-| 工具 | 读到入口 | 发现 skills | 接续任务 | 写入工作区 |
-|---|---|---|---|---|
-| Claude Code 2.1.296 | ✅ | ✅ | ✅ | ✅ |
-| Codex 0.162.1 | ✅ | ✅ | ✅ | ✅（workspace-write 沙箱下可以在工作区内 commit） |
-| Gemini CLI 0.63.0 | ⚠️ | ✅ | ✅ | 未测 |
+| 工具 | 读到入口 | 会话开头注入 | 发现 skills | 接续任务 | 写入工作区 |
+|---|---|---|---|---|---|
+| Claude Code 2.1.308 | ✅ | —（项目级 `CLAUDE.local.md`） | ✅ | ✅ | ✅ |
+| Codex 0.162.1 | ✅ | ✅（SessionStart hook，需审核一次） | ✅ | ✅ | ✅（workspace-write 沙箱下可以在工作区内 commit） |
+| Gemini CLI 0.63.0 | ⚠️ | ✅（SessionStart hook，受信任文件夹） | ✅ | ✅ | 未测 |
 
 **已知限制**
 
