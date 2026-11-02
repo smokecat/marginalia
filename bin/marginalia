@@ -256,6 +256,8 @@ agent_home() { # <agent>：配置目录（遵守各工具的环境变量），�
 agent_skills() { # <agent>：不读 ~/.agents/skills、需要另外软链 skills 的目录
   case $1 in
     claude) echo "$(agent_home claude)/skills" ;;
+    # Gemini 把 GEMINI_CLI_HOME 当家目录，用户级 skills 读的是它下面的 .agents/skills
+    gemini) [ -z "${GEMINI_CLI_HOME:-}" ] || [ "$GEMINI_CLI_HOME" = "$HOME" ] || echo "$GEMINI_CLI_HOME/.agents/skills" ;;
   esac
 }
 agent_global() { # <agent>：全局入口文件（写托管块；hook 不生效时的兜底）
@@ -328,7 +330,8 @@ unlink_ours() { # <dst> <src>：只删除指向本仓库的软链
   if [ -L "$1" ] && [ "$(readlink "$1")" = "$2" ]; then rm "$1"; say REMOVED "$1"; fi
 }
 
-HOOK_CMD="$BIN_DIR/marginalia hook session-start"  # 写进各 agent 配置的命令；改动会让 Codex 要求重新审核
+# 写进各 agent 配置的命令（经 shell 执行，路径要转义）；改动会让 Codex 要求重新审核
+HOOK_CMD="$(printf '%q' "$BIN_DIR/marginalia") hook session-start"
 
 cmd_setup() {
   local s a f dir seen="" rp
@@ -339,7 +342,11 @@ cmd_setup() {
     link "$s" "$SHARED_SKILLS/$(basename "$s")"
     for a in $KNOWN_AGENTS; do
       dir=$(agent_skills "$a"); [ -n "$dir" ] || continue
-      if is_enabled "$a"; then link "$s" "$dir/$(basename "$s")"; else unlink_ours "$dir/$(basename "$s")" "$s"; fi
+      if is_enabled "$a"; then
+        link "$s" "$dir/$(basename "$s")"
+      elif [ "$(helper realpath "$dir")" != "$(helper realpath "$SHARED_SKILLS")" ]; then
+        unlink_ours "$dir/$(basename "$s")" "$s"   # 和共享目录是同一个目录时不能删
+      fi
     done
   done
   link "$SELF" "$BIN_DIR/marginalia"
@@ -386,7 +393,7 @@ cmd_setup() {
 }
 
 cmd_uninstall() {
-  local s a f dir
+  local s a f dir r
   for s in "$MARGINALIA_HOME"/skills/*/; do
     s=${s%/}
     unlink_ours "$SHARED_SKILLS/$(basename "$s")" "$s"
@@ -397,7 +404,9 @@ cmd_uninstall() {
   unlink_ours "$BIN_DIR/marginalia" "$SELF"
   for a in $KNOWN_AGENTS; do
     f=$(agent_global "$a"); [ -z "$f" ] || say "$(helper remove-block "$f")" "$f 全局入口"
-    f=$(agent_hook "$a"); [ -z "$f" ] || say "$(helper remove-hook "$f")" "$f SessionStart hook"
+    f=$(agent_hook "$a"); [ -n "$f" ] || continue
+    r=$(helper remove-hook "$f"); say "$r" "$f SessionStart hook"
+    [ "$a" != codex ] || [ "$r" != REMOVED ] || say INFO "Codex 按序号记 hook 的审核状态，排在 marginalia 后面的其他 SessionStart hook 可能需要重新审核一次"
   done
   say INFO "项目内的私有工作区、CLAUDE.local.md 托管块等未改动"
 }
@@ -416,9 +425,15 @@ cmd_context() { # [目录]
 # 不在有工作区的项目里、或出了任何错，都静默退出 0，不打断会话
 cmd_hook() { # session-start <agent>
   [ "${1:-}" = session-start ] || exit 0
-  local cwd text
+  local cwd text rc
+  # agent 以会话目录为 cwd 启动 hook，stdin 里读不到 cwd 时用当前目录
   cwd=$(helper hook-input-cwd 2>/dev/null) || cwd=""
-  text=$(cmd_context "${cwd:-$PWD}" 2>/dev/null) || exit 0
+  # 不能写成 text=$(…) || exit 0：|| 左边会关掉 set -e，内部的失败（如配置读不了）就不再中止
+  set +e
+  text=$(set -e; cmd_context "${cwd:-$PWD}" 2>/dev/null)
+  rc=$?
+  set -e
+  [ $rc = 0 ] || exit 0
   printf '%s\n' "$text" | helper hook-output 2>/dev/null || true
 }
 
@@ -524,6 +539,7 @@ cmd_init() {
   [ -z "$want" ] || valid_dir "$want" || die "目录名不合法：${want}（只能是项目根下的一级名字，不能是 .git 等）"
   [ -d "${dir:-.}" ] || die "目录不存在：$dir"
   dir=$(cd "${dir:-.}" && pwd -P)
+  enabled_agents  # 先校验 agents 配置，免得写了一半才报错
 
   local ROOT
   if ROOT=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null); then
@@ -609,7 +625,6 @@ cmd_init() {
   [ -z "$tracked" ] || say CONFLICT "以下私有路径已被主仓库跟踪，exclude 对它们不生效（未擅自 git rm --cached）：$tracked"
 
   # 3. 各 agent 的项目级入口：启用的 agent，或以前已经落地过（入口还在就继续维护）
-  enabled_agents
   for a in $KNOWN_AGENTS; do
     f=$(agent_project "$a"); [ -n "$f" ] || continue
     if is_enabled "$a" || "${f}_present" "$ROOT"; then
@@ -654,6 +669,7 @@ cmd_migrate() {
   done
   [ -d "${dir:-.}" ] || die "目录不存在：$dir"
   dir=$(cd "${dir:-.}" && pwd -P)
+  enabled_agents  # 迁移最后会跑 init，先校验 agents 配置
   local ROOT MAIN from moved=0 r wt wts="" EX refs pf pt problems="" root
   ROOT=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || die_nostore "不在 git 项目中"
   if r=$(inside_ws "$ROOT"); then ROOT=$r; fi
@@ -760,7 +776,7 @@ WTS
   while IFS= read -r wt; do
     [ -n "$wt" ] || continue
     had=0
-    if [ -L "$wt/$from" ]; then rm "$wt/$from"; had=1; fi   # 预检保证它指向主工作区
+    [ ! -L "$wt/$from" ] || had=1   # 预检保证它指向主工作区
     if [ -L "$wt/$to" ]; then
       :
     elif [ $had = 1 ] || grep -qF '<!-- marginalia:start -->' "$wt/CLAUDE.local.md" 2>/dev/null; then
@@ -768,6 +784,8 @@ WTS
     else
       continue  # 这个 worktree 没有初始化过
     fi
+    # 新链接建好之后才删旧的：中途中断时旧链接还在，重跑能认出这个 worktree
+    [ $had = 0 ] || rm "$wt/$from"
     say INFO "worktree：$wt"
     if grep -qF '<!-- marginalia:start -->' "$wt/CLAUDE.local.md" 2>/dev/null; then claude_entry "$wt" 0; fi
     [ ! -e "$wt/.claude/settings.local.json" ] || memory_entry "$wt" "$L/memory" "$OLD/memory"

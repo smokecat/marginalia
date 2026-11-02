@@ -61,6 +61,9 @@ def remove_block(path):
         return "SKIPPED"
     rest = (text[:span[0]].rstrip("\n") + "\n\n" + text[span[1]:].lstrip("\n")).strip("\n")
     if not rest.strip():
+        if os.path.islink(path):  # 软链（如 dotfiles 管理的）只清空内容，不删链接
+            write(path, "")
+            return "REMOVED"
         os.remove(path)
         return "DELETED"
     write(path, rest + "\n")
@@ -250,6 +253,10 @@ HOOK_MARK = "marginalia hook session-start"  # 命令里带这一段的 hook 视
 HOOK_TIMEOUT = {"codex": 10, "gemini": 10000}
 
 
+def write_json(path, data):
+    write(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+
 def load_json(path):
     """读 JSON 配置文件（不存在时为空对象），无法解析或顶层不是对象时返回 None。"""
     if not os.path.exists(path):
@@ -261,13 +268,20 @@ def load_json(path):
     return data if isinstance(data, dict) else None
 
 
-def ours(group):
-    return isinstance(group, dict) and any(isinstance(h, dict) and HOOK_MARK in str(h.get("command", ""))
-                                           for h in group.get("hooks") or [])
+def ours(handler):
+    return isinstance(handler, dict) and HOOK_MARK in str(handler.get("command", ""))
+
+
+def handlers(group):
+    hs = group.get("hooks") if isinstance(group, dict) else None
+    return hs if isinstance(hs, list) else []
 
 
 def set_hook(agent, path, command):
-    """在 agent 的配置文件里写入（或更新）marginalia 的 SessionStart hook，其他内容不动。"""
+    """在 agent 的配置文件里写入（或更新）marginalia 的 SessionStart hook，其他内容不动。
+
+    只动 marginalia 自己的 handler：已有的就地更新（和用户的 handler 同组也不拆），没有才在末尾追加一组，
+    不改变其他组的序号（Codex 按「组序号 + 内容」记审核状态）。"""
     data = load_json(path)
     if data is None:
         return "CONFLICT 无法解析或顶层不是对象，未修改"
@@ -277,32 +291,43 @@ def set_hook(agent, path, command):
     handler = {"type": "command", "command": command, "timeout": HOOK_TIMEOUT[agent]}
     if agent == "gemini":
         handler["name"] = "marginalia"
-    want = {"hooks": [handler]}
     groups = hooks.setdefault("SessionStart", [])
-    mine = [i for i, g in enumerate(groups) if ours(g)]
-    if [groups[i] for i in mine] == [want]:
-        return "SKIPPED"
-    state = "UPDATED" if mine else "CREATED"
-    if mine:
-        groups[mine[0]] = want  # 原位替换：Codex 按组序号记审核状态
-        for i in reversed(mine[1:]):
-            del groups[i]
+    found = [(g, i) for g in groups for i, h in enumerate(handlers(g)) if ours(h)]
+    if not found:
+        groups.append({"hooks": [handler]})
+        state = "CREATED"
     else:
-        groups.append(want)
-    write(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+        if len(found) == 1 and found[0][0]["hooks"][found[0][1]] == handler:
+            return "SKIPPED"
+        g, i = found[0]
+        g["hooks"][i] = handler
+        for g, i in reversed(found[1:]):  # 重复的只删 handler，组留着（空组也保留，不挪动后面组的序号）
+            del g["hooks"][i]
+        state = "UPDATED"
+    write_json(path, data)
     return state
 
 
 def remove_hook(path):
-    """删除 marginalia 的 SessionStart hook；SessionStart / hooks 因此变空时一并删掉，文件只剩空对象时删文件。"""
+    """删除 marginalia 的 SessionStart handler。组里只剩它时删掉整组；SessionStart / hooks 因此变空时一并删掉。"""
     data = load_json(path)
     if not data:
         return "SKIPPED"
     hooks = data.get("hooks")
     if not isinstance(hooks, dict) or not isinstance(hooks.get("SessionStart"), list):
         return "SKIPPED"
-    groups = [g for g in hooks["SessionStart"] if not ours(g)]
-    if len(groups) == len(hooks["SessionStart"]):
+    changed = False
+    groups = []
+    for g in hooks["SessionStart"]:
+        hs = handlers(g)
+        rest = [h for h in hs if not ours(h)]
+        if len(rest) != len(hs):
+            changed = True
+            if not rest:
+                continue
+            g["hooks"] = rest
+        groups.append(g)
+    if not changed:
         return "SKIPPED"
     if groups:
         hooks["SessionStart"] = groups
@@ -310,10 +335,10 @@ def remove_hook(path):
         del hooks["SessionStart"]
         if not hooks:
             del data["hooks"]
-    if not data:
+    if not data and not os.path.islink(path):
         os.remove(path)
         return "DELETED"
-    write(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    write_json(path, data)
     return "REMOVED"
 
 

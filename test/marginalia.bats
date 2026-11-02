@@ -827,6 +827,90 @@ PY
   [ "$status" -eq 0 ] && [ -z "$output" ]
 }
 
+@test "hook 配置：和用户 handler 同组时只动自己的 handler；配置是软链时不删链接" {
+  mkdir -p "$HOME/.codex" "$HOME/dotfiles"
+  printf '{"hooks":{"SessionStart":[{"matcher":"startup","hooks":[{"type":"command","command":"mine"},{"type":"command","command":"old/marginalia hook session-start codex"}]},{"hooks":[{"type":"command","command":"later"}]}]}}\n' > "$HOME/.codex/hooks.json"
+  mg setup
+  [ "$(jq_py "$HOME/.codex/hooks.json" 'len(d["hooks"]["SessionStart"])')" = 2 ]
+  [ "$(jq_py "$HOME/.codex/hooks.json" 'd["hooks"]["SessionStart"][0]["matcher"]')" = startup ]
+  [ "$(jq_py "$HOME/.codex/hooks.json" 'd["hooks"]["SessionStart"][0]["hooks"][0]["command"]')" = mine ]
+  [ "$(jq_py "$HOME/.codex/hooks.json" 'd["hooks"]["SessionStart"][0]["hooks"][1]["command"]')" = "$HOME/.local/bin/marginalia hook session-start codex" ]
+  mg uninstall
+  [ "$(jq_py "$HOME/.codex/hooks.json" 'd["hooks"]["SessionStart"][0]["hooks"]')" = "[{'type': 'command', 'command': 'mine'}]" ]
+  [ "$(jq_py "$HOME/.codex/hooks.json" 'd["hooks"]["SessionStart"][1]["hooks"][0]["command"]')" = later ]
+  # 软链的配置文件：只剩 marginalia 的 hook 时清空内容，链接保留
+  command rm "$HOME/.codex/hooks.json"
+  ln -s "$HOME/dotfiles/hooks.json" "$HOME/.codex/hooks.json"
+  mg setup
+  [ -L "$HOME/.codex/hooks.json" ]
+  run mg uninstall
+  [ -L "$HOME/.codex/hooks.json" ]
+  [ "$(jq_py "$HOME/dotfiles/hooks.json" 'd')" = "{}" ]
+}
+
+@test "hook 命令里的路径带空格时会转义" {
+  export HOME="$BATS_TEST_TMPDIR/my home"
+  mkdir -p "$HOME/.claude" "$HOME/.codex"
+  export GIT_CONFIG_GLOBAL="$HOME/.gitconfig"
+  git config --global user.name test && git config --global user.email test@example.com
+  mg setup
+  cmd=$(jq_py "$HOME/.codex/hooks.json" 'd["hooks"]["SessionStart"][0]["hooks"][0]["command"]')
+  init_repo "$P" && mg init "$P"
+  run bash -c "printf '{\"cwd\":\"%s\"}' '$P' | $cmd"
+  [ "$status" -eq 0 ]
+  has "additionalContext"
+}
+
+@test "config agents：Claude 的 skills 目录就是共享目录时，禁用 Claude 不删共享 skills" {
+  mkdir -p "$HOME/.agents/skills" "$HOME/.codex"
+  command rm -rf "$HOME/.claude" && mkdir -p "$HOME/.claude"
+  ln -s "$HOME/.agents/skills" "$HOME/.claude/skills"
+  mg config --user agents codex
+  mg setup
+  [ -L "$HOME/.agents/skills/marginalia-task" ]
+}
+
+@test "GEMINI_CLI_HOME：入口、hook 和 skills 都落在它下面" {
+  export GEMINI_CLI_HOME="$BATS_TEST_TMPDIR/ghome"
+  mkdir -p "$GEMINI_CLI_HOME/.gemini"
+  mg setup
+  grep -q "marginalia:start" "$GEMINI_CLI_HOME/.gemini/GEMINI.md"
+  [ -e "$GEMINI_CLI_HOME/.gemini/settings.json" ]
+  [ -L "$GEMINI_CLI_HOME/.agents/skills/marginalia-task" ]
+  mg uninstall
+  [ ! -e "$GEMINI_CLI_HOME/.agents/skills/marginalia-task" ]
+}
+
+@test "init：agents 配置不合法时一开始就报错，不写任何文件" {
+  init_repo "$P"
+  mkdir -p "$HOME/.marginalia" && git config -f "$HOME/.marginalia/config" marginalia.agents bogus
+  run mg init "$P"
+  [ "$status" -ne 0 ]
+  has "marginalia.agents 不合法"
+  [ ! -e "$P/.margin" ]
+}
+
+@test "migrate：只启用 Codex 的 worktree（没有 CLAUDE.local.md）也会改链接" {
+  mg config --user agents codex
+  init_repo "$P"
+  git -C "$P" commit -q --allow-empty -m init
+  mg init --dir .notes "$P"
+  git -C "$P" worktree add -q "$BATS_TEST_TMPDIR/wt" -b wt
+  mg init "$BATS_TEST_TMPDIR/wt"
+  [ -L "$BATS_TEST_TMPDIR/wt/.notes" ] && [ ! -e "$BATS_TEST_TMPDIR/wt/CLAUDE.local.md" ]
+  run mg migrate --to .margin "$P"
+  [ "$status" -eq 0 ]
+  [ "$(readlink "$BATS_TEST_TMPDIR/wt/.margin")" = "$P/.margin" ]
+  [ ! -e "$BATS_TEST_TMPDIR/wt/.notes" ] && [ ! -L "$BATS_TEST_TMPDIR/wt/.notes" ]
+}
+
+@test "hook：stdin 不是 JSON 且当前目录不在项目里时，stdout 和 stderr 都为空" {
+  mkdir -p "$BATS_TEST_TMPDIR/plain"
+  cd "$BATS_TEST_TMPDIR/plain"
+  run bash -c "printf 'garbage' | '${MARGINALIA_TEST_BASH:-bash}' '$REPO/bin/marginalia' hook session-start codex 2>&1"
+  [ "$status" -eq 0 ] && [ -z "$output" ]
+}
+
 @test "setup：全局入口按用户默认目录名生成" {
   mkdir -p "$HOME/.codex"
   mg config --user dir .notes
