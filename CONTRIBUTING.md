@@ -22,13 +22,14 @@ macOS 上 bats 本身需要 bash 4+（系统自带的 3.2 处理不了中文测�
 - **零痕迹**：除了 `--create-claude-md`，任何操作都不能修改主仓库中受版本控制的文件。
 - **幂等**：重复运行 `init` / `setup` 不能产生新的变更，也不能覆盖用户数据。
 - 改了行为就补测试（`test/marginalia.bats`）。
+- **加一个 agent**：登记进 `KNOWN_AGENTS`，在 `bin/marginalia` 的适配器函数（`agent_home` / `agent_skills` / `agent_global` / `agent_hook` / `agent_project`）里补它的分支，没有的能力留空；hook 格式不同的话改 `lib/helpers.py` 的 `set_hook`。测试用假 HOME 覆盖 setup / uninstall。
 
 ## 模板与 skill 的写法
 
 `templates/` 和 `skills/` 是写给 agent 读的：
 
 - 写目标和不变量，不规定步骤和频率；marginalia 不规定工作方法。
-- 一条规则只写在一个地方：详细约定在 `templates/local/README.md`，入口托管块只放指引。
+- 一条规则只写在一个地方：详细约定在 `templates/local/README.md`；各 agent 入口共用的核心约定在 `templates/entry-core.md`（Claude 托管块、hook 注入、`marginalia context` 都由它渲染），不要在某个 agent 的入口模板里单独加规则。
 - frontmatter 只用 [Agent Skills](https://agentskills.io) 标准字段，保证各工具都能加载。
 
 ## 提交信息

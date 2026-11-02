@@ -19,6 +19,8 @@ SYSTEM_CONFIG=${MARGINALIA_SYSTEM_CONFIG:-/etc/marginalia/config}
 USER_CONFIG=${MARGINALIA_USER_CONFIG:-$HOME/.marginalia/config}
 
 say() { printf '[%s] %s\n' "$1" "$2"; }
+# helper 返回「标签 说明」时：标签进方括号，说明接在消息后面
+say_r() { say "${1%% *}" "$2${1#"${1%% *}"}"; }
 die() { printf 'marginalia: %s\n' "$*" >&2; exit 1; }
 # 没有可用的工作区（不在 git 项目中 / 项目没有初始化）：退出码 5，供其他程序区分
 die_nostore() { printf 'marginalia: %s\n' "$*" >&2; exit 5; }
@@ -376,7 +378,7 @@ cmd_setup() {
     fi
     f=$(agent_hook "$a")
     if [ -n "$f" ]; then
-      say "$(helper set-hook "$a" "$f" "$HOOK_CMD $a")" "$f SessionStart hook"
+      say_r "$(helper set-hook "$a" "$f" "$HOOK_CMD $a")" "$f SessionStart hook"
       [ "$a" != codex ] || say INFO "Codex 首次启动时会提示审核新的 hook（Hooks need review），确认后生效；codex exec 里未审核的 hook 不会运行"
       [ "$a" != gemini ] || say INFO "Gemini 只在受信任的文件夹里运行 hook"
     fi
@@ -472,7 +474,7 @@ memory_entry() { # <工作树根> <memory 绝对路径> [旧路径]
   local r
   mkdir -p "$1/.claude"
   r=$(helper set-memory-dir "$1/.claude/settings.local.json" "$2" "${3:-}")
-  say "${r%% *}" ".claude/settings.local.json autoMemoryDirectory → $2${r#"${r%% *}"}"
+  say_r "$r" ".claude/settings.local.json autoMemoryDirectory → $2"
 }
 
 # Claude Code 的项目级入口：CLAUDE.local.md 托管块、auto memory 指向工作区、迁移原有 auto memory

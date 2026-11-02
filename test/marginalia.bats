@@ -689,6 +689,144 @@ legacy_project() {
   [ "$status" -eq 5 ]
 }
 
+# ------------------------------------------------------------------ agent 适配器
+
+jq_py() { python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(eval(sys.argv[2]))" "$@"; }
+
+@test "setup：为 Codex / Gemini 写 SessionStart hook，保留已有配置，幂等；uninstall 恢复原样" {
+  mkdir -p "$HOME/.codex" "$HOME/.gemini"
+  printf '{"theme":"x","hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"mine"}]}]}}\n' > "$HOME/.gemini/settings.json"
+  run mg setup
+  [ "$status" -eq 0 ]
+  has "hooks.json SessionStart hook"
+  [ "$(jq_py "$HOME/.codex/hooks.json" 'd["hooks"]["SessionStart"][0]["hooks"][0]["command"]')" = "$HOME/.local/bin/marginalia hook session-start codex" ]
+  [ "$(jq_py "$HOME/.codex/hooks.json" 'd["hooks"]["SessionStart"][0]["hooks"][0]["timeout"]')" = 10 ]
+  [ "$(jq_py "$HOME/.gemini/settings.json" 'd["theme"]')" = x ]
+  [ "$(jq_py "$HOME/.gemini/settings.json" 'len(d["hooks"]["SessionStart"])')" = 2 ]
+  [ "$(jq_py "$HOME/.gemini/settings.json" 'd["hooks"]["SessionStart"][1]["hooks"][0]["timeout"]')" = 10000 ]
+  run mg setup
+  lacks "[CREATED]"
+  lacks "[UPDATED]"
+  run mg uninstall
+  [ "$status" -eq 0 ]
+  [ ! -e "$HOME/.codex/hooks.json" ]
+  [ "$(jq_py "$HOME/.gemini/settings.json" 'd["hooks"]["SessionStart"][0]["hooks"][0]["command"]')" = mine ]
+  [ "$(jq_py "$HOME/.gemini/settings.json" 'len(d["hooks"]["SessionStart"])')" = 1 ]
+}
+
+@test "setup：hook 配置文件无法解析时报冲突，不改动" {
+  mkdir -p "$HOME/.gemini"
+  printf '{ // 注释\n}\n' > "$HOME/.gemini/settings.json"
+  run mg setup
+  [ "$status" -eq 0 ]
+  has "[CONFLICT]"
+  [ "$(cat "$HOME/.gemini/settings.json")" = "$(printf '{ // 注释\n}')" ]
+}
+
+@test "setup：多个全局入口软链到同一文件时只写一次" {
+  mkdir -p "$HOME/.agents" "$HOME/.codex" "$HOME/.gemini"
+  printf '# 共用说明\n' > "$HOME/.agents/AGENTS.md"
+  ln -s "$HOME/.agents/AGENTS.md" "$HOME/.codex/AGENTS.md"
+  ln -s "$HOME/.agents/AGENTS.md" "$HOME/.gemini/GEMINI.md"
+  run mg setup
+  has "与前面的同一文件"
+  [ "$(grep -c 'marginalia:start' "$HOME/.agents/AGENTS.md")" = 1 ]
+  [ -L "$HOME/.codex/AGENTS.md" ] && [ -L "$HOME/.gemini/GEMINI.md" ]
+}
+
+@test "config agents：显式选择后 setup 撤掉未启用 agent 的入口，但不删共用文件里的块" {
+  mkdir -p "$HOME/.agents" "$HOME/.codex" "$HOME/.gemini"
+  printf '# 共用说明\n' > "$HOME/.agents/AGENTS.md"
+  ln -s "$HOME/.agents/AGENTS.md" "$HOME/.codex/AGENTS.md"
+  ln -s "$HOME/.agents/AGENTS.md" "$HOME/.gemini/GEMINI.md"
+  mg setup
+  [ -L "$HOME/.claude/skills/marginalia-task" ]
+  run mg config --user agents codex
+  [ "$status" -eq 0 ]
+  run mg config agents
+  [ "$output" = codex ]
+  run mg setup
+  has "启用的 agent：codex"
+  [ ! -e "$HOME/.claude/skills/marginalia-task" ]
+  [ -L "$HOME/.agents/skills/marginalia-task" ]
+  grep -q 'marginalia:start' "$HOME/.agents/AGENTS.md"
+  [ "$(jq_py "$HOME/.gemini/settings.json" '"hooks" in d')" = False ] || [ ! -e "$HOME/.gemini/settings.json" ]
+  [ -e "$HOME/.codex/hooks.json" ]
+  run mg config --user agents claude,bogus
+  [ "$status" -ne 0 ]
+  run mg config --project agents codex
+  [ "$status" -ne 0 ]
+  mg config --user --unset agents
+  run mg config agents
+  [ "$output" = "claude codex gemini" ]
+}
+
+@test "init：Claude 未启用时不写 CLAUDE.local.md；已有托管块则继续维护" {
+  init_repo "$P"
+  mg config --user agents codex
+  run mg init "$P"
+  [ "$status" -eq 0 ]
+  has "claude 未启用"
+  [ ! -e "$P/CLAUDE.local.md" ] && [ ! -e "$P/.claude/settings.local.json" ]
+  mg config --user --unset agents
+  mg init "$P"
+  [ -f "$P/CLAUDE.local.md" ]
+  mg config --user agents codex
+  run mg init "$P"
+  lacks "claude 未启用"
+  has "CLAUDE.local.md 托管块"
+}
+
+@test "Claude 托管块与 context 用同一份核心约定" {
+  init_repo "$P"
+  mg init "$P"
+  cd "$P"
+  run mg context
+  [ "$status" -eq 0 ]
+  has "**决策**"
+  python3 - "$P/CLAUDE.local.md" "$REPO/templates/entry-core.md" <<'PY'
+import sys
+local, core = open(sys.argv[1]).read(), open(sys.argv[2]).read().replace("{{DIR}}", ".margin").strip()
+assert core in local, "CLAUDE.local.md 里没有完整的核心约定"
+PY
+}
+
+@test "context：核心约定、活跃任务（不含 done）、经验索引；没有工作区时退出码 5" {
+  init_repo "$P"
+  mg init "$P"
+  cd "$P"
+  mg task new alpha 阿尔法
+  mg task new beta
+  mg task status beta done
+  printf '# Memory index\n- [坑](pit.md) — 某个坑\n' > .margin/memory/MEMORY.md
+  run mg context
+  [ "$status" -eq 0 ]
+  has "# 私有工作区（.margin/）"
+  has '`alpha`（active）阿尔法'
+  lacks '`beta`'
+  has "- [坑](pit.md) — 某个坑"
+  lacks "# Memory index"
+  mkdir -p "$BATS_TEST_TMPDIR/other" && init_repo "$BATS_TEST_TMPDIR/other"
+  run mg context "$BATS_TEST_TMPDIR/other"
+  [ "$status" -eq 5 ]
+}
+
+@test "hook session-start：按 stdin 的 cwd 输出 additionalContext；其他情况静默退出 0" {
+  init_repo "$P"
+  mg init "$P"
+  mkdir -p "$P/sub"
+  run bash -c "printf '{\"cwd\":\"%s\"}' '$P/sub' | '${MARGINALIA_TEST_BASH:-bash}' '$REPO/bin/marginalia' hook session-start codex"
+  [ "$status" -eq 0 ]
+  python3 -c 'import json,sys; d=json.loads(sys.argv[1])["hookSpecificOutput"]; assert d["hookEventName"]=="SessionStart"; assert "私有工作区（.margin/）" in d["additionalContext"]' "$output"
+  mkdir -p "$BATS_TEST_TMPDIR/plain"
+  run bash -c "printf '{\"cwd\":\"%s\"}' '$BATS_TEST_TMPDIR/plain' | '${MARGINALIA_TEST_BASH:-bash}' '$REPO/bin/marginalia' hook session-start gemini"
+  [ "$status" -eq 0 ] && [ -z "$output" ]
+  run bash -c "printf 'not json' | '${MARGINALIA_TEST_BASH:-bash}' '$REPO/bin/marginalia' hook session-start gemini"
+  [ "$status" -eq 0 ]
+  run bash -c "printf '{\"cwd\":\"/nonexistent\"}' | '${MARGINALIA_TEST_BASH:-bash}' '$REPO/bin/marginalia' hook session-start codex"
+  [ "$status" -eq 0 ] && [ -z "$output" ]
+}
+
 @test "setup：全局入口按用户默认目录名生成" {
   mkdir -p "$HOME/.codex"
   mg config --user dir .notes
