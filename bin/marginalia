@@ -219,7 +219,7 @@ cmd_config() {
 config_agents() { # <级别> <是否 unset> <是否给了值> <值>
   local level=$1 unset=$2 have=$3 value=$4 file
   case $level in
-    "") [ "$unset" = 0 ] && [ "$have" = 0 ] || die "设置或删除时需要指定级别：--system | --user"
+    "") if [ "$unset" = 1 ] || [ "$have" = 1 ]; then die "设置或删除时需要指定级别：--system | --user"; fi
         enabled_agents; echo "$ENABLED"; return ;;
     project) die "agents 只能在 --system 或 --user 级别设置" ;;
     system) file=$SYSTEM_CONFIG ;;
