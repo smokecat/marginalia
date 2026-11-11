@@ -27,6 +27,7 @@ ARCHIVED_SHOWN = 20
 OUTPUT_BUDGET = 380 * 1024
 DETAIL_MAX = 4000
 TEXT_MAX = 300
+PATH_MAX = 4096  # trine 对 files.open 路径的上限
 
 
 class NoStore(Exception):
@@ -80,6 +81,27 @@ def rel_path(task, ctx):
     return os.path.relpath(os.path.join(task.get("project") or project_root(cwd), task["path"]), cwd)
 
 
+def abs_readme(task, ctx):
+    """任务 README 的绝对路径：CLI 给的 project + path（path 已含工作区目录名与 archived/，改了目录名、归档后都对）。"""
+    cwd = ctx.get("cwd") or os.getcwd()
+    return os.path.normpath(os.path.join(task.get("project") or project_root(cwd), task["path"]))
+
+
+def can_open_files(ctx):
+    """trine 协商出了 files.open（新 agent + 新 web、在会话面板里）；旧版本不带 features。"""
+    return "files.open" in (ctx.get("features") or [])
+
+
+def file_actions(task, ctx):
+    readme = abs_readme(task, ctx)
+    if len(readme) > PATH_MAX:
+        return []
+    return [
+        {"id": "browse-dir", "label": "浏览任务目录", "effects": [{"type": "files.open", "path": os.path.dirname(readme), "dir": True}]},
+        {"id": "open-readme", "label": "打开 README", "effects": [{"type": "files.open", "path": readme}]},
+    ]
+
+
 def badges(task):
     if task["archived"]:
         return [{"text": "已归档", "tone": "neutral"}]
@@ -127,6 +149,8 @@ def item(task, ctx, in_session):
             actions.append({"id": "resume-here", "label": "接续到本会话", "effects": [{"type": "prompt.send", "text": resume_prompt(task)}]})
     if in_session:
         actions.append({"id": "insert", "label": "插入引用", "effects": [{"type": "prompt.insert", "text": rel_path(task, ctx)}]})
+    if in_session and can_open_files(ctx):
+        actions.extend(file_actions(task, ctx))
     if not task["archived"]:
         if task["status"] != "done":
             actions.append({"id": "status", "label": "标为完成", "invoke": {"params": {"slug": slug, "status": "done"}}})

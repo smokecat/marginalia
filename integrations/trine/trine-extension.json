@@ -3,7 +3,7 @@
   "id": "marginalia",
   "name": "Marginalia 任务",
   "version": "0.2.0",
-  "description": "显示项目私有工作区里的 marginalia 任务，关联会话、一键接续",
+  "description": "显示项目私有工作区里的 marginalia 任务，关联会话、一键接续、打开任务目录",
   "entry": ["bin/trine-ext"],
   "contributes": {
     "sessionPanel": { "title": "任务", "icon": "list-checks" },

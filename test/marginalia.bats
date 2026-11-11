@@ -379,6 +379,42 @@ PY
   has '"ok": true'
 }
 
+@test "trine 扩展：协商出 files.open 时每个任务可浏览目录 / 打开 README（自定义目录名、归档任务）" {
+  init_repo "$P"
+  mg init --dir .notes "$P"
+  cd "$P"
+  mg task new alpha 'Alpha 任务'
+  mg task new beta
+  mg task status beta done
+  mg task archive beta
+  mkdir -p "$P/src"
+  local session='"session":{"id":"s1","links":[]},"linkedSessions":[]'
+  run ext view '{"op":"view","point":"sessionPanel","context":{"cwd":"'"$P/src"'",'"$session"',"features":["files.open"]}}'
+  [ "$status" -eq 0 ]
+  python3 - "$output" "$P" <<'PY'
+import json, os, sys
+v = json.loads(sys.argv[1])["view"]
+root = os.path.realpath(sys.argv[2])
+items = {i["id"]: i for s in v["sections"] for i in s["items"]}
+def opens(item):
+    return {a["id"]: a["effects"] for a in item["actions"] if a["id"] in ("browse-dir", "open-readme")}
+real = lambda p: os.path.realpath(p)
+for slug, rel in (("alpha", ".notes/tasks/alpha"), ("beta", ".notes/tasks/archived/beta")):
+    o = opens(items[slug])
+    (d,), (f,) = o["browse-dir"], o["open-readme"]
+    assert d["type"] == "files.open" and d["dir"] is True and os.path.isabs(d["path"]), d
+    assert real(d["path"]) == os.path.join(root, rel), (d, rel)
+    assert f["type"] == "files.open" and "dir" not in f and real(f["path"]) == os.path.join(root, rel, "README.md"), f
+    assert len(items[slug]["actions"]) <= 8
+PY
+  # 旧 agent / 旧 web（不带 features）：没有这两个动作
+  run ext view '{"op":"view","point":"sessionPanel","context":{"cwd":"'"$P"'",'"$session"'}}'
+  python3 -c 'import json,sys; v=json.loads(sys.argv[1])["view"]; assert not [a for s in v["sections"] for i in s["items"] for a in i.get("actions",[]) if a["id"] in ("browse-dir","open-readme")]' "$output"
+  # 工作区面板没有会话：即使带了也不给
+  run ext view '{"op":"view","point":"workspacePanel","context":{"cwd":"'"$P"'","linkedSessions":[],"features":["files.open"]}}'
+  python3 -c 'import json,sys; v=json.loads(sys.argv[1])["view"]; assert not [a for s in v["sections"] for i in s["items"] for a in i.get("actions",[]) if a["id"] in ("browse-dir","open-readme")]' "$output"
+}
+
 @test "trine 扩展：缺 frontmatter 的任务进「无法读取」，不静默消失" {
   init_repo "$P"
   mg init "$P"

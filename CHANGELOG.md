@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+### 新增
+
+- trine 扩展：trine 协商出 `files.open` 特性时（`context.features`），会话面板里每个任务多出「浏览任务目录」「打开 README」，用 CLI 给的 project + path 推出绝对路径，支持自定义工作区目录名和已归档任务；旧版 trine 下不显示。
+
 ### 变更
 
 - 各 agent 入口共用一份核心约定（`templates/entry-core.md`）；原来只写在 `CLAUDE.local.md` 托管块里的「决策」「私有边界」规则补进工作区规范 `README.md`。
