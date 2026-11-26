@@ -183,14 +183,16 @@ trine 的 agent 和网页都支持文件打开（`files.open` 特性）时，会
 |---|---|---|---|---|---|
 | Claude Code 2.1.308 | ✅ | —（项目级 `CLAUDE.local.md`） | ✅ | ✅ | ✅ |
 | Codex 0.166.0 | ✅ | ✅（SessionStart hook，需审核一次） | ✅ | ✅ | ✅（workspace-write 沙箱下可以在工作区内 commit） |
-| Gemini CLI 0.63.0 | ⚠️ | ✅（SessionStart hook，受信任文件夹） | ✅ | ✅ | 未测 |
+| Antigravity CLI 1.5.18 | ✅ | ✅（SessionStart hook，`agy -p` 里也生效） | ✅ | ✅ | ✅（能直接读写被 git 忽略的工作区并 commit） |
+
+Gemini CLI 已弃用，不再测试（0.63.0 时 hook 注入可用，但 `read_file` 拒绝读取被 git 忽略的路径）。
 
 **已知限制**
 
-- Gemini CLI 的 `read_file` 会拒绝读取被 git 忽略的路径，读工作区要绕道其他工具（hook 注入的上下文不受影响）。`respectGitIgnore` 是整个项目的开关，关掉会把 `node_modules` 等也暴露出来，所以 marginalia 不去改它。需要的话可以在项目的 `.geminiignore` 里加 `!.margin/` 和 `!.margin/**` 放行，并把 `.geminiignore` 也加进 `.git/info/exclude`——这要往项目里放文件，marginalia 不自动做。
 - Codex 的 hook 要先在 TUI 里审核才会运行，`codex exec` 里未审核的 hook 直接跳过；hook 命令变了（如 `~/.local/bin` 位置变了）需要重新审核。没有生效时，全局入口托管块会提示 agent 自己运行 `marginalia context`。
-- Gemini 的 `settings.json` 带注释（JSONC）时 marginalia 无法安全改写，会报 `[CONFLICT]`；可以参照 `marginalia setup` 在干净文件里写出的结构手动添加。
-- Codex、Gemini 自己的原生记忆（`~/.codex/memories`、`~/.gemini/tmp/<项目>/memory`）路径固定、由工具自己管理，marginalia 不去接管，共享经验以 `.margin/memory/` 为准。
+- agy 的 `hooks.json` 带注释（JSONC）时 marginalia 无法安全改写，会报 `[CONFLICT]`；可以参照 `marginalia setup` 在干净文件里写出的结构手动添加。
+- agy 在 `hooks.json` 所在目录启动 hook，会话目录只能从 hook 输入的 `cwd` 拿；输出必须是 `injectSteps` 格式的 JSON，纯文本不会注入。
+- Codex 自己的原生记忆（`~/.codex/memories`）路径固定、由工具自己管理，marginalia 不去接管，共享经验以 `.margin/memory/` 为准。
 - 从项目子目录启动 Claude Code 时，`CLAUDE.local.md` 里对上级 `AGENTS.md` 的 import 算外部 import，需要在审批对话框里确认一次。
 - 模板和 skill 目前是中文。
 
