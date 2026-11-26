@@ -3,7 +3,7 @@
 [![CI](https://github.com/smokecat/marginalia/actions/workflows/ci.yml/badge.svg)](https://github.com/smokecat/marginalia/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**给 coding agent 的零痕迹私有工作区。** 在项目里放一个只有你本机可见的 `.margin/`（目录名可配置），让 Claude Code、Codex、Gemini CLI 等工具跨会话、跨工具地接续任务、共享项目经验——不往共享仓库里提交任何文件。
+**给 coding agent 的零痕迹私有工作区。** 在项目里放一个只有你本机可见的 `.margin/`（目录名可配置），让 Claude Code、Codex、Antigravity CLI 等工具跨会话、跨工具地接续任务、共享项目经验——不往共享仓库里提交任何文件。
 
 > *marginalia*：页边批注。在别人的书页边上写自己的笔记，书本身不变。
 
@@ -37,7 +37,9 @@ your-project/
 |---|---|---|---|---|
 | Claude Code | 项目内 `CLAUDE.local.md` 托管块 | — | `~/.claude/skills/`（软链） | auto memory 直接指向 `.margin/memory/` |
 | Codex | 用户级 SessionStart hook（`~/.codex/hooks.json`）注入 | `~/.codex/AGENTS.md` 托管块（遵守 `CODEX_HOME`） | `~/.agents/skills/` | hook 注入 `MEMORY.md` 索引，按约定读写 |
-| Gemini CLI | 用户级 SessionStart hook（`~/.gemini/settings.json`）注入 | `~/.gemini/GEMINI.md` 托管块（遵守 `GEMINI_CLI_HOME`） | `~/.agents/skills/` | 同上 |
+| Antigravity CLI（`agy`） | 用户级 SessionStart hook（`~/.gemini/config/hooks.json`）注入 | `~/.gemini/GEMINI.md` 托管块 | `~/.gemini/skills/`（软链） | 同上 |
+
+Antigravity CLI 接替了已弃用的 Gemini CLI，配置目录仍是 `~/.gemini/`；以 `~/.gemini/antigravity-cli/` 存在作为已安装的判断，只剩旧 Gemini CLI 的 `~/.gemini/` 不算。旧版 marginalia 写在 Gemini CLI `settings.json` 里的 hook，`setup` / `uninstall` 会顺手撤掉；`marginalia.agents` 里写的 `gemini` 按 `agy` 处理，并提示改名。
 
 hook 调用的是 `marginalia hook session-start <agent>`：在会话目录找到工作区时，注入核心约定、活跃任务和经验索引；不在 marginalia 项目里时什么都不输出。注入的内容也可以用 `marginalia context` 直接查看，没有 hook 的 agent 可以手动跑它。
 
@@ -64,10 +66,10 @@ git clone https://github.com/smokecat/marginalia.git ~/.local/share/marginalia  
 
 `setup` 会：
 
-- 把 skills 软链到 `~/.agents/skills/` 和 `~/.claude/skills/`（遵守 `CLAUDE_CONFIG_DIR`）
+- 把 skills 软链到 `~/.agents/skills/`、`~/.claude/skills/`（遵守 `CLAUDE_CONFIG_DIR`）和 `~/.gemini/skills/`（agy 不读 `~/.agents/skills/`；`~/.gemini/skills` 本身软链到共享目录时不重复建）
 - 把 `marginalia` 命令软链到 `~/.local/bin/`
-- 为启用的 Codex / Gemini CLI 写入全局入口托管块和 SessionStart hook（工具未安装则跳过，装好后重跑即可）；多个全局入口软链到同一份文件时只写一次
-- Codex 首次启动时会提示审核这个 hook（Hooks need review），确认后生效；Gemini 只在受信任的文件夹里运行 hook
+- 为启用的 Codex / agy 写入全局入口托管块和 SessionStart hook（工具未安装则跳过，装好后重跑即可）；多个全局入口软链到同一份文件时只写一次
+- Codex 首次启动时会提示审核这个 hook（Hooks need review），确认后生效；agy 的 hook 写成 `hooks.json` 里名为 `marginalia` 的条目，其他条目不动，在条目上设 `"enabled": false` 可以临时关掉（重跑 setup 会保留）
 
 升级：`git pull` 后重跑 `marginalia setup`，再在各项目里重跑 `marginalia init`。还在用 `.local/` 的旧项目见[从 `.local` 迁移](#从-local-迁移)。
 
@@ -94,7 +96,7 @@ marginalia init [--dir 名字] [--git-init] [--update-spec] [--create-claude-md]
 marginalia migrate [--to 名字] [--dry-run] [目录]
 marginalia config [--list]
 marginalia config [--system|--user|--project] [--unset] dir [名字]
-marginalia config [--system|--user] [--unset] agents [auto|claude,codex,gemini]
+marginalia config [--system|--user] [--unset] agents [auto|claude,codex,agy]
 marginalia context [目录]
 marginalia task new <slug> [标题]
 marginalia task list [--json] [--archived]
@@ -136,7 +138,7 @@ marginalia --version
 
 `init` 会把实际用的目录名写进项目配置，之后再改默认值，已有项目不受影响；要给已有工作区改名，用 `migrate`。环境变量不覆盖项目配置，避免 shell 里的一个变量让所有已有项目找不到工作区。
 
-Codex 和 Gemini CLI 的全局入口按用户默认值生成，改了默认值后重跑 `marginalia setup`。
+Codex 和 agy 的全局入口按用户默认值生成，改了默认值后重跑 `marginalia setup`。
 
 ## 从 `.local` 迁移
 

@@ -10,6 +10,7 @@
 
 ### 变更
 
+- Gemini CLI 已弃用，适配器改为接替它的 Antigravity CLI（`agy`）：hook 写进 `~/.gemini/config/hooks.json`（名为 `marginalia` 的条目，输出 `injectSteps`），skills 软链到 `~/.gemini/skills/`，全局入口仍是 `~/.gemini/GEMINI.md`；以 `~/.gemini/antigravity-cli/` 判断是否已安装。`setup` / `uninstall` 会撤掉旧版写在 Gemini CLI `settings.json` 里的 hook；`marginalia.agents` 里的 `gemini` 按 `agy` 处理并提示改名。不再支持 `GEMINI_CLI_HOME`（agy 不认它），只在清理旧 hook 时沿用。
 - 各 agent 入口共用一份核心约定（`templates/entry-core.md`）；原来只写在 `CLAUDE.local.md` 托管块里的「决策」「私有边界」规则补进工作区规范 `README.md`。
 - Claude Code 未启用时，`init` 不再写 `CLAUDE.local.md` 和 `.claude/settings.local.json`（已经落地过的继续维护）。
 - 多个全局入口软链到同一份文件时，`setup` 只写一次托管块。

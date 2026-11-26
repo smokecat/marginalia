@@ -12,7 +12,9 @@ STATUSES="active paused blocked done"
 PREV_DIR=""  # migrate 刚把工作区从这个名字改走（init 据此自动更新未改动过的规范文件）
 SHARED_SKILLS="$HOME/.agents/skills"  # Agent Skills 的跨工具目录，多数 agent 直接读这里
 BIN_DIR="$HOME/.local/bin"
-KNOWN_AGENTS="claude codex gemini"
+KNOWN_AGENTS="claude codex agy"
+# 已弃用的 agent 名 → 接替它的 agent（配置里写旧名时按新名处理）
+legacy_agent() { case $1 in gemini) echo agy ;; *) echo "$1" ;; esac; }
 BUILTIN_DIR=.margin
 LEGACY_DIR=.local
 SYSTEM_CONFIG=${MARGINALIA_SYSTEM_CONFIG:-/etc/marginalia/config}
@@ -54,7 +56,8 @@ usage() {
 目录名优先级（高 → 低）：项目（.git/config 的 marginalia.dir）> 环境变量 MARGINALIA_DIR
 > 用户（~/.marginalia/config）> 系统（/etc/marginalia/config）> 内置 .margin。
 init 会把实际使用的目录名写进项目配置，之后改默认值不影响已有项目。
-支持的 agent：claude codex gemini；默认启用已安装的（配置目录存在）。
+支持的 agent：claude codex agy（Antigravity CLI，接替已弃用的 Gemini CLI；配置里的 gemini 按 agy 处理）；
+默认启用已安装的（配置目录存在）。
 
 输出中的 [ASK] 表示需要用户决定，[CONFLICT] 表示未自动处理的冲突。
 EOF
@@ -213,7 +216,7 @@ cmd_config() {
     git config -f "$file" marginalia.dir "$value" || die "无法写入 ${file}（系统级配置可能需要 sudo）"
     say UPDATED "$file marginalia.dir = $value"
   fi
-  say INFO "只影响之后新初始化的项目；Codex / Gemini 的全局入口按默认目录名生成，重跑 marginalia setup 更新"
+  say INFO "只影响之后新初始化的项目；Codex / agy 的全局入口按默认目录名生成，重跑 marginalia setup 更新"
 }
 
 config_agents() { # <级别> <是否 unset> <是否给了值> <值>
@@ -235,6 +238,7 @@ config_agents() { # <级别> <是否 unset> <是否给了值> <值>
     mkdir -p "$(dirname "$file")" 2>/dev/null || die "无法创建 $(dirname "$file")（系统级配置可能需要 sudo）"
     git config -f "$file" marginalia.agents "$value" || die "无法写入 ${file}（系统级配置可能需要 sudo）"
     say UPDATED "$file marginalia.agents = $value"
+    warn_legacy_agents "$value" "$file"
   fi
   say INFO "重跑 marginalia setup 生效（未启用的 agent 的全局入口和 hook 会被撤掉）；已有项目的入口在重跑 init 时更新"
 }
@@ -250,27 +254,33 @@ agent_home() { # <agent>：配置目录（遵守各工具的环境变量），�
   case $1 in
     claude) echo "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" ;;
     codex) echo "${CODEX_HOME:-$HOME/.codex}" ;;
-    gemini) echo "${GEMINI_CLI_HOME:-$HOME}/.gemini" ;;
+    # agy 的配置固定在 ~/.gemini 下（没有改位置的环境变量）；~/.gemini 本身可能是旧 Gemini CLI 留下的，以 CLI 自己的目录为准
+    agy) echo "$AGY_ROOT/antigravity-cli" ;;
   esac
 }
+AGY_ROOT="$HOME/.gemini"
 agent_skills() { # <agent>：不读 ~/.agents/skills、需要另外软链 skills 的目录
   case $1 in
     claude) echo "$(agent_home claude)/skills" ;;
-    # Gemini 把 GEMINI_CLI_HOME 当家目录，用户级 skills 读的是它下面的 .agents/skills
-    gemini) [ -z "${GEMINI_CLI_HOME:-}" ] || [ "$GEMINI_CLI_HOME" = "$HOME" ] || echo "$GEMINI_CLI_HOME/.agents/skills" ;;
+    agy) echo "$AGY_ROOT/skills" ;;
   esac
 }
 agent_global() { # <agent>：全局入口文件（写托管块；hook 不生效时的兜底）
   case $1 in
     codex) echo "$(agent_home codex)/AGENTS.md" ;;
-    gemini) echo "$(agent_home gemini)/GEMINI.md" ;;
+    agy) echo "$AGY_ROOT/GEMINI.md" ;;
   esac
 }
 agent_hook() { # <agent>：写 SessionStart hook 的配置文件（hook 调用 marginalia hook session-start <agent>）
   case $1 in
     codex) echo "$(agent_home codex)/hooks.json" ;;
-    gemini) echo "$(agent_home gemini)/settings.json" ;;
+    agy) echo "$AGY_ROOT/config/hooks.json" ;;
   esac
+}
+# 已弃用的 Gemini CLI 留下的 SessionStart hook（旧版 marginalia 写在它的 settings.json 里），setup / uninstall 时撤掉
+LEGACY_GEMINI_HOOK="${GEMINI_CLI_HOME:-$HOME}/.gemini/settings.json"
+remove_legacy_hooks() {
+  [ "$(helper remove-hook gemini "$LEGACY_GEMINI_HOOK")" = SKIPPED ] || say REMOVED "$LEGACY_GEMINI_HOOK SessionStart hook（Gemini CLI 已弃用，改用 agy）"
 }
 agent_project() { # <agent>：项目级入口的实现（init 在每个工作树里调用）；没有的为空
   case $1 in
@@ -286,13 +296,18 @@ agents_conf() { # <配置文件>
   [ $rc -le 1 ] || die "无法读取配置文件 $1（git config 退出码 ${rc}）"
   printf '%s' "$v"
 }
-valid_agents() { # <列表>：auto，或若干个已知 agent
+valid_agents() { # <列表>：auto，或若干个已知 agent（含弃用的旧名）
   local a
   [ "$1" = auto ] && return 0
   [ -n "$(printf '%s' "$1" | tr -d ', ')" ] || return 1
   for a in $(printf '%s' "$1" | tr ',' ' '); do
-    case " $KNOWN_AGENTS " in *" $a "*) ;; *) return 1 ;; esac
+    case " $KNOWN_AGENTS " in *" $(legacy_agent "$a") "*) ;; *) return 1 ;; esac
   done
+}
+agents_list() { # <列表>：逗号/空格分隔的列表，弃用的旧名换成新名，空格分隔输出
+  local a out=""
+  for a in $(printf '%s' "$1" | tr ',' ' '); do out="$out $(legacy_agent "$a")"; done
+  printf '%s' "${out# }"
 }
 enabled_agents() { # 结果放在 ENABLED（空格分隔）和 AGENTS_SRC（auto / 配置文件）
   local v a out=""
@@ -304,10 +319,15 @@ enabled_agents() { # 结果放在 ENABLED（空格分隔）和 AGENTS_SRC（auto
   else
     valid_agents "$v" || die "marginalia.agents 不合法：${v}（来自 ${AGENTS_SRC}；可选 auto 或 ${KNOWN_AGENTS}）"
     for a in $KNOWN_AGENTS; do
-      case " $(printf '%s' "$v" | tr ',' ' ') " in *" $a "*) out="$out $a" ;; esac
+      case " $(agents_list "$v") " in *" $a "*) out="$out $a" ;; esac
     done
   fi
   ENABLED=${out# }
+}
+warn_legacy_agents() { # <列表> <来源>：列表里有弃用的旧名时提示改写
+  case ",$(printf '%s' "$1" | tr ' ' ','),"  in
+    *,gemini,*) say WARN "$2 里的 gemini 已弃用（Gemini CLI 由 Antigravity CLI 接替），按 agy 处理；建议改为 agy" ;;
+  esac
 }
 is_enabled() { case " $ENABLED " in *" $1 "*) return 0 ;; esac; return 1; }
 
@@ -337,6 +357,8 @@ cmd_setup() {
   local s a f dir seen="" rp
   enabled_agents
   say INFO "启用的 agent：${ENABLED:-（无）}（$( [ "$AGENTS_SRC" = auto ] && echo 已安装的 || echo "$AGENTS_SRC")；marginalia config agents 可改）"
+  [ "$AGENTS_SRC" = auto ] || warn_legacy_agents "$(agents_conf "$AGENTS_SRC")" "$AGENTS_SRC"
+  remove_legacy_hooks
   for s in "$MARGINALIA_HOME"/skills/*/; do
     s=${s%/}
     link "$s" "$SHARED_SKILLS/$(basename "$s")"
@@ -368,7 +390,7 @@ cmd_setup() {
           *) [ "$(helper remove-block "$f")" = SKIPPED ] || say REMOVED "$f 全局入口（$a 未启用）" ;;
         esac
       fi
-      f=$(agent_hook "$a"); [ -z "$f" ] || [ "$(helper remove-hook "$f")" = SKIPPED ] || say REMOVED "$f SessionStart hook（$a 未启用）"
+      f=$(agent_hook "$a"); [ -z "$f" ] || [ "$(helper remove-hook "$a" "$f")" = SKIPPED ] || say REMOVED "$f SessionStart hook（$a 未启用）"
       continue
     fi
     if [ ! -d "$(agent_home "$a")" ]; then
@@ -387,7 +409,6 @@ cmd_setup() {
     if [ -n "$f" ]; then
       say_r "$(helper set-hook "$a" "$f" "$HOOK_CMD $a")" "$f SessionStart hook"
       [ "$a" != codex ] || say INFO "Codex 首次启动时会提示审核新的 hook（Hooks need review），确认后生效；codex exec 里未审核的 hook 不会运行"
-      [ "$a" != gemini ] || say INFO "Gemini 只在受信任的文件夹里运行 hook"
     fi
   done
 }
@@ -405,9 +426,10 @@ cmd_uninstall() {
   for a in $KNOWN_AGENTS; do
     f=$(agent_global "$a"); [ -z "$f" ] || say "$(helper remove-block "$f")" "$f 全局入口"
     f=$(agent_hook "$a"); [ -n "$f" ] || continue
-    r=$(helper remove-hook "$f"); say "$r" "$f SessionStart hook"
+    r=$(helper remove-hook "$a" "$f"); say "$r" "$f SessionStart hook"
     [ "$a" != codex ] || [ "$r" != REMOVED ] || say INFO "Codex 按序号记 hook 的审核状态，排在 marginalia 后面的其他 SessionStart hook 可能需要重新审核一次"
   done
+  remove_legacy_hooks
   say INFO "项目内的私有工作区、CLAUDE.local.md 托管块等未改动"
 }
 
@@ -425,8 +447,8 @@ cmd_context() { # [目录]
 # 不在有工作区的项目里、或出了任何错，都静默退出 0，不打断会话
 cmd_hook() { # session-start <agent>
   [ "${1:-}" = session-start ] || exit 0
-  local cwd text rc
-  # agent 以会话目录为 cwd 启动 hook，stdin 里读不到 cwd 时用当前目录
+  local agent=${2:-} cwd text rc
+  # 会话目录取 stdin 里的 cwd（agy 在 hooks.json 所在目录启动 hook，当前目录不可靠）；读不到时用当前目录
   cwd=$(helper hook-input-cwd 2>/dev/null) || cwd=""
   # 不能写成 text=$(…) || exit 0：|| 左边会关掉 set -e，内部的失败（如配置读不了）就不再中止
   set +e
@@ -434,7 +456,7 @@ cmd_hook() { # session-start <agent>
   rc=$?
   set -e
   [ $rc = 0 ] || exit 0
-  printf '%s\n' "$text" | helper hook-output 2>/dev/null || true
+  printf '%s\n' "$text" | helper hook-output "$agent" 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------- init

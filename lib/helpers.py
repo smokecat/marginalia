@@ -249,11 +249,16 @@ def context(local, core):
 
 
 HOOK_MARK = "marginalia hook session-start"  # 命令里带这一段的 hook 视为 marginalia 的
-# 各 agent hook 的超时单位不同：Codex 是秒，Gemini 是毫秒
-HOOK_TIMEOUT = {"codex": 10, "gemini": 10000}
+# hook 超时（秒）
+HOOK_TIMEOUT = {"codex": 10, "agy": 10}
+# agy 的 hooks.json 顶层是「hook 名 → {事件: [handler]}」，marginalia 用这个名字
+AGY_HOOK_NAME = "marginalia"
 
 
 def write_json(path, data):
+    parent = os.path.dirname(path)
+    if parent and not os.path.isdir(parent):
+        os.makedirs(parent)
     write(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
 
 
@@ -282,6 +287,8 @@ def set_hook(agent, path, command):
 
     只动 marginalia 自己的 handler：已有的就地更新（和用户的 handler 同组也不拆），没有才在末尾追加一组，
     不改变其他组的序号（Codex 按「组序号 + 内容」记审核状态）。"""
+    if agent == "agy":
+        return set_hook_agy(path, command)
     data = load_json(path)
     if data is None:
         return "CONFLICT 无法解析或顶层不是对象，未修改"
@@ -289,8 +296,6 @@ def set_hook(agent, path, command):
     if not isinstance(hooks, dict) or not isinstance(hooks.get("SessionStart", []), list):
         return "CONFLICT hooks 结构不认识，未修改"
     handler = {"type": "command", "command": command, "timeout": HOOK_TIMEOUT[agent]}
-    if agent == "gemini":
-        handler["name"] = "marginalia"
     groups = hooks.setdefault("SessionStart", [])
     found = [(g, i) for g in groups for i, h in enumerate(handlers(g)) if ours(h)]
     if not found:
@@ -308,11 +313,67 @@ def set_hook(agent, path, command):
     return state
 
 
-def remove_hook(path):
+def set_hook_agy(path, command):
+    """agy 的 hooks.json：写入（或更新）名为 marginalia 的条目，其他条目不动；别的条目里混进的 marginalia handler 删掉。"""
+    data = load_json(path)
+    if data is None:
+        return "CONFLICT 无法解析或顶层不是对象，未修改"
+    cur = data.get(AGY_HOOK_NAME)
+    if cur is not None and not (isinstance(cur, dict) and all(ours(h) for hs in cur.values() if isinstance(hs, list) for h in hs)):
+        return "CONFLICT 已有名为 %s 的其他 hook，未修改" % AGY_HOOK_NAME
+    # 用户在条目上设的 enabled 等字段保留（如 enabled: false 临时关掉）
+    want = dict((k, v) for k, v in (cur or {}).items() if not isinstance(v, list))
+    want["SessionStart"] = [{"type": "command", "command": command, "timeout": HOOK_TIMEOUT["agy"]}]
+    strays = strip_agy(data, skip=AGY_HOOK_NAME)
+    if cur == want and not strays:
+        return "SKIPPED"
+    data[AGY_HOOK_NAME] = want
+    write_json(path, data)
+    return "UPDATED" if cur is not None or strays else "CREATED"
+
+
+def strip_agy(data, skip=None):
+    """从 agy 的 hooks.json 数据里删掉 marginalia 的 handler（事件、条目因此变空时一并删掉），返回是否有改动。"""
+    changed = False
+    for name in list(data):
+        entry = data[name]
+        if name == skip or not isinstance(entry, dict):
+            continue
+        touched = False
+        for event in list(entry):
+            hs = entry[event]
+            if not isinstance(hs, list):
+                continue
+            rest = [h for h in hs if not ours(h)]
+            if len(rest) == len(hs):
+                continue
+            touched = True
+            if rest:
+                entry[event] = rest
+            else:
+                del entry[event]
+        if touched and not any(isinstance(v, list) for v in entry.values()):
+            del data[name]  # 只剩 enabled 之类的字段，整条删掉
+        changed = changed or touched
+    return changed
+
+
+def save_or_delete(path, data):
+    """配置删到为空时删除文件（软链只清空内容），否则写回。"""
+    if not data and not os.path.islink(path):
+        os.remove(path)
+        return "DELETED"
+    write_json(path, data)
+    return "REMOVED"
+
+
+def remove_hook(agent, path):
     """删除 marginalia 的 SessionStart handler。组里只剩它时删掉整组；SessionStart / hooks 因此变空时一并删掉。"""
     data = load_json(path)
     if not data:
         return "SKIPPED"
+    if agent == "agy":
+        return save_or_delete(path, data) if strip_agy(data) else "SKIPPED"
     hooks = data.get("hooks")
     if not isinstance(hooks, dict) or not isinstance(hooks.get("SessionStart"), list):
         return "SKIPPED"
@@ -335,11 +396,7 @@ def remove_hook(path):
         del hooks["SessionStart"]
         if not hooks:
             del data["hooks"]
-    if not data and not os.path.islink(path):
-        os.remove(path)
-        return "DELETED"
-    write_json(path, data)
-    return "REMOVED"
+    return save_or_delete(path, data)
 
 
 def hook_input_cwd():
@@ -352,11 +409,15 @@ def hook_input_cwd():
     return cwd if isinstance(cwd, str) else ""
 
 
-def hook_output():
-    """SessionStart hook 的输出（注入文本从 stdin 读）：Codex 和 Gemini 都认 hookSpecificOutput.additionalContext（Gemini 只认 JSON）。"""
+def hook_output(agent=""):
+    """SessionStart hook 的输出（注入文本从 stdin 读）。
+
+    agy 只认 injectSteps（纯文本输出不会注入）；Codex 和旧的 Gemini CLI 认 hookSpecificOutput.additionalContext。"""
     text = sys.stdin.read().strip("\n")
     if not text:
         return ""
+    if agent == "agy":
+        return json.dumps({"injectSteps": [{"systemMessage": {"systemMessage": text}}]}, ensure_ascii=False)
     return json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}}, ensure_ascii=False)
 
 

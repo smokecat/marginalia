@@ -5,7 +5,7 @@ setup() {
   REPO=$(cd "$BATS_TEST_DIRNAME/.." && pwd -P)
   # 隔离 HOME 与 git 全局配置，测试不读写真实环境
   export HOME="$BATS_TEST_TMPDIR/home"
-  mkdir -p "$HOME/.claude"  # 默认只装了 Claude Code；测 Codex / Gemini 的用例自己建配置目录
+  mkdir -p "$HOME/.claude"  # 默认只装了 Claude Code；测 Codex / agy 的用例自己建配置目录
   export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$HOME/.gitconfig"
   git config --global user.name test
   git config --global user.email test@example.com
@@ -491,13 +491,15 @@ PY
 }
 
 @test "uninstall：移除软链和全局入口，保留用户自己的内容" {
-  mkdir -p "$HOME/.codex" "$HOME/.gemini"
+  mkdir -p "$HOME/.codex" "$HOME/.gemini/antigravity-cli"
   printf '# 我自己的 Codex 说明\n' > "$HOME/.codex/AGENTS.md"
   mg setup
+  [ -L "$HOME/.gemini/skills/marginalia-task" ]
   mkdir -p "$HOME/.agents/skills/other" && ln -s /tmp "$HOME/.claude/skills/not-ours"
   run mg uninstall
   [ "$status" -eq 0 ]
   [ ! -e "$HOME/.agents/skills/marginalia-task" ] && [ ! -e "$HOME/.claude/skills/marginalia-task" ]
+  [ ! -e "$HOME/.gemini/skills/marginalia-task" ] && [ ! -e "$HOME/.gemini/config/hooks.json" ]
   [ ! -e "$HOME/.local/bin/marginalia" ]
   [ "$(cat "$HOME/.codex/AGENTS.md")" = "# 我自己的 Codex 说明" ]
   [ ! -e "$HOME/.gemini/GEMINI.md" ]
@@ -729,38 +731,94 @@ legacy_project() {
 
 jq_py() { python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(eval(sys.argv[2]))" "$@"; }
 
-@test "setup：为 Codex / Gemini 写 SessionStart hook，保留已有配置，幂等；uninstall 恢复原样" {
-  mkdir -p "$HOME/.codex" "$HOME/.gemini"
-  printf '{"theme":"x","hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"mine"}]}]}}\n' > "$HOME/.gemini/settings.json"
+@test "setup：为 Codex / agy 写 SessionStart hook，保留已有配置，幂等；uninstall 恢复原样" {
+  mkdir -p "$HOME/.codex" "$HOME/.gemini/antigravity-cli" "$HOME/.gemini/config"
+  printf '{"mine":{"SessionStart":[{"type":"command","command":"mine"}]}}\n' > "$HOME/.gemini/config/hooks.json"
   run mg setup
   [ "$status" -eq 0 ]
   has "hooks.json SessionStart hook"
   [ "$(jq_py "$HOME/.codex/hooks.json" 'd["hooks"]["SessionStart"][0]["hooks"][0]["command"]')" = "$HOME/.local/bin/marginalia hook session-start codex" ]
   [ "$(jq_py "$HOME/.codex/hooks.json" 'd["hooks"]["SessionStart"][0]["hooks"][0]["timeout"]')" = 10 ]
-  [ "$(jq_py "$HOME/.gemini/settings.json" 'd["theme"]')" = x ]
-  [ "$(jq_py "$HOME/.gemini/settings.json" 'len(d["hooks"]["SessionStart"])')" = 2 ]
-  [ "$(jq_py "$HOME/.gemini/settings.json" 'd["hooks"]["SessionStart"][1]["hooks"][0]["timeout"]')" = 10000 ]
+  [ "$(jq_py "$HOME/.gemini/config/hooks.json" 'd["mine"]["SessionStart"][0]["command"]')" = mine ]
+  [ "$(jq_py "$HOME/.gemini/config/hooks.json" 'd["marginalia"]["SessionStart"][0]["command"]')" = "$HOME/.local/bin/marginalia hook session-start agy" ]
+  [ "$(jq_py "$HOME/.gemini/config/hooks.json" 'd["marginalia"]["SessionStart"][0]["timeout"]')" = 10 ]
+  grep -q "marginalia:start" "$HOME/.gemini/GEMINI.md"
   run mg setup
   lacks "[CREATED]"
   lacks "[UPDATED]"
   run mg uninstall
   [ "$status" -eq 0 ]
   [ ! -e "$HOME/.codex/hooks.json" ]
-  [ "$(jq_py "$HOME/.gemini/settings.json" 'd["hooks"]["SessionStart"][0]["hooks"][0]["command"]')" = mine ]
-  [ "$(jq_py "$HOME/.gemini/settings.json" 'len(d["hooks"]["SessionStart"])')" = 1 ]
+  [ "$(jq_py "$HOME/.gemini/config/hooks.json" 'sorted(d)')" = "['mine']" ]
+}
+
+@test "agy hook：没有 hooks.json 时连目录一起建；保留 enabled 等字段；别人占用 marginalia 这个名字时报冲突" {
+  mkdir -p "$HOME/.gemini/antigravity-cli"
+  mg setup
+  [ "$(jq_py "$HOME/.gemini/config/hooks.json" 'sorted(d)')" = "['marginalia']" ]
+  # 用户临时关掉，并把一个旧的 marginalia handler 混在自己的条目里
+  python3 - "$HOME/.gemini/config/hooks.json" <<'PY'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["marginalia"]["enabled"] = False
+d["mine"] = {"SessionStart": [{"type": "command", "command": "mine"}, {"type": "command", "command": "old/marginalia hook session-start agy"}]}
+d["solo"] = {"SessionStart": [{"type": "command", "command": "older/marginalia hook session-start agy"}]}
+json.dump(d, open(p, "w"))
+PY
+  run mg setup
+  has "[UPDATED]"
+  [ "$(jq_py "$HOME/.gemini/config/hooks.json" 'd["marginalia"]["enabled"]')" = False ]
+  [ "$(jq_py "$HOME/.gemini/config/hooks.json" 'd["mine"]["SessionStart"]')" = "[{'type': 'command', 'command': 'mine'}]" ]
+  [ "$(jq_py "$HOME/.gemini/config/hooks.json" '"solo" in d')" = False ]
+  printf '{"marginalia":{"SessionStart":[{"type":"command","command":"something-else"}]}}\n' > "$HOME/.gemini/config/hooks.json"
+  run mg setup
+  has "[CONFLICT]"
+  [ "$(jq_py "$HOME/.gemini/config/hooks.json" 'd["marginalia"]["SessionStart"][0]["command"]')" = something-else ]
 }
 
 @test "setup：hook 配置文件无法解析时报冲突，不改动" {
-  mkdir -p "$HOME/.gemini"
-  printf '{ // 注释\n}\n' > "$HOME/.gemini/settings.json"
+  mkdir -p "$HOME/.gemini/antigravity-cli" "$HOME/.gemini/config"
+  printf '{ // 注释\n}\n' > "$HOME/.gemini/config/hooks.json"
   run mg setup
   [ "$status" -eq 0 ]
   has "[CONFLICT]"
-  [ "$(cat "$HOME/.gemini/settings.json")" = "$(printf '{ // 注释\n}')" ]
+  [ "$(cat "$HOME/.gemini/config/hooks.json")" = "$(printf '{ // 注释\n}')" ]
+}
+
+@test "已弃用的 Gemini CLI：只有旧 ~/.gemini 不算装了 agy；setup / uninstall 撤掉它 settings.json 里的旧 hook" {
+  mkdir -p "$HOME/.gemini"
+  printf '{"theme":"x","hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"mine"}]},{"hooks":[{"type":"command","command":"/x/marginalia hook session-start gemini","timeout":10000,"name":"marginalia"}]}]}}\n' > "$HOME/.gemini/settings.json"
+  run mg setup
+  [ "$status" -eq 0 ]
+  has "启用的 agent：claude（"
+  has "Gemini CLI 已弃用"
+  [ ! -e "$HOME/.gemini/GEMINI.md" ] && [ ! -e "$HOME/.gemini/config" ] && [ ! -e "$HOME/.gemini/skills" ]
+  [ "$(jq_py "$HOME/.gemini/settings.json" 'd["theme"]')" = x ]
+  [ "$(jq_py "$HOME/.gemini/settings.json" 'len(d["hooks"]["SessionStart"])')" = 1 ]
+  # GEMINI_CLI_HOME 下的旧配置，uninstall 也清
+  export GEMINI_CLI_HOME="$BATS_TEST_TMPDIR/ghome"
+  mkdir -p "$GEMINI_CLI_HOME/.gemini"
+  printf '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"/x/marginalia hook session-start gemini"}]}]}}\n' > "$GEMINI_CLI_HOME/.gemini/settings.json"
+  run mg uninstall
+  has "Gemini CLI 已弃用"
+  [ ! -e "$GEMINI_CLI_HOME/.gemini/settings.json" ]
+}
+
+@test "config agents：gemini 按 agy 处理并提示改名" {
+  mkdir -p "$HOME/.gemini/antigravity-cli"
+  run mg config --user agents claude,gemini
+  [ "$status" -eq 0 ]
+  has "gemini 已弃用"
+  run mg config agents
+  [ "$output" = "claude agy" ]
+  run mg setup
+  has "gemini 已弃用"
+  has "启用的 agent：claude agy"
+  [ -e "$HOME/.gemini/config/hooks.json" ]
 }
 
 @test "setup：多个全局入口软链到同一文件时只写一次" {
-  mkdir -p "$HOME/.agents" "$HOME/.codex" "$HOME/.gemini"
+  mkdir -p "$HOME/.agents" "$HOME/.codex" "$HOME/.gemini/antigravity-cli"
   printf '# 共用说明\n' > "$HOME/.agents/AGENTS.md"
   ln -s "$HOME/.agents/AGENTS.md" "$HOME/.codex/AGENTS.md"
   ln -s "$HOME/.agents/AGENTS.md" "$HOME/.gemini/GEMINI.md"
@@ -771,12 +829,13 @@ jq_py() { python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(eva
 }
 
 @test "config agents：显式选择后 setup 撤掉未启用 agent 的入口，但不删共用文件里的块" {
-  mkdir -p "$HOME/.agents" "$HOME/.codex" "$HOME/.gemini"
+  mkdir -p "$HOME/.agents" "$HOME/.codex" "$HOME/.gemini/antigravity-cli"
   printf '# 共用说明\n' > "$HOME/.agents/AGENTS.md"
   ln -s "$HOME/.agents/AGENTS.md" "$HOME/.codex/AGENTS.md"
   ln -s "$HOME/.agents/AGENTS.md" "$HOME/.gemini/GEMINI.md"
   mg setup
-  [ -L "$HOME/.claude/skills/marginalia-task" ]
+  [ -L "$HOME/.claude/skills/marginalia-task" ] && [ -L "$HOME/.gemini/skills/marginalia-task" ]
+  [ -e "$HOME/.gemini/config/hooks.json" ]
   run mg config --user agents codex
   [ "$status" -eq 0 ]
   run mg config agents
@@ -786,7 +845,7 @@ jq_py() { python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(eva
   [ ! -e "$HOME/.claude/skills/marginalia-task" ]
   [ -L "$HOME/.agents/skills/marginalia-task" ]
   grep -q 'marginalia:start' "$HOME/.agents/AGENTS.md"
-  [ "$(jq_py "$HOME/.gemini/settings.json" '"hooks" in d')" = False ] || [ ! -e "$HOME/.gemini/settings.json" ]
+  [ ! -e "$HOME/.gemini/config/hooks.json" ] && [ ! -e "$HOME/.gemini/skills/marginalia-task" ]
   [ -e "$HOME/.codex/hooks.json" ]
   run mg config --user agents claude,bogus
   [ "$status" -ne 0 ]
@@ -794,7 +853,7 @@ jq_py() { python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(eva
   [ "$status" -ne 0 ]
   mg config --user --unset agents
   run mg config agents
-  [ "$output" = "claude codex gemini" ]
+  [ "$output" = "claude codex agy" ]
 }
 
 @test "init：Claude 未启用时不写 CLAUDE.local.md；已有托管块则继续维护" {
@@ -854,10 +913,14 @@ PY
   run bash -c "printf '{\"cwd\":\"%s\"}' '$P/sub' | '${MARGINALIA_TEST_BASH:-bash}' '$REPO/bin/marginalia' hook session-start codex"
   [ "$status" -eq 0 ]
   python3 -c 'import json,sys; d=json.loads(sys.argv[1])["hookSpecificOutput"]; assert d["hookEventName"]=="SessionStart"; assert "私有工作区（.margin/）" in d["additionalContext"]' "$output"
+  # agy 只认 injectSteps；它在 hooks.json 所在目录启动 hook，会话目录只能从 stdin 拿
+  run bash -c "cd / && printf '{\"cwd\":\"%s\",\"hookEventName\":\"SessionStart\"}' '$P/sub' | '${MARGINALIA_TEST_BASH:-bash}' '$REPO/bin/marginalia' hook session-start agy"
+  [ "$status" -eq 0 ]
+  python3 -c 'import json,sys; d=json.loads(sys.argv[1])["injectSteps"][0]["systemMessage"]["systemMessage"]; assert "私有工作区（.margin/）" in d' "$output"
   mkdir -p "$BATS_TEST_TMPDIR/plain"
-  run bash -c "printf '{\"cwd\":\"%s\"}' '$BATS_TEST_TMPDIR/plain' | '${MARGINALIA_TEST_BASH:-bash}' '$REPO/bin/marginalia' hook session-start gemini"
+  run bash -c "printf '{\"cwd\":\"%s\"}' '$BATS_TEST_TMPDIR/plain' | '${MARGINALIA_TEST_BASH:-bash}' '$REPO/bin/marginalia' hook session-start agy"
   [ "$status" -eq 0 ] && [ -z "$output" ]
-  run bash -c "printf 'not json' | '${MARGINALIA_TEST_BASH:-bash}' '$REPO/bin/marginalia' hook session-start gemini"
+  run bash -c "printf 'not json' | '${MARGINALIA_TEST_BASH:-bash}' '$REPO/bin/marginalia' hook session-start agy"
   [ "$status" -eq 0 ]
   run bash -c "printf '{\"cwd\":\"/nonexistent\"}' | '${MARGINALIA_TEST_BASH:-bash}' '$REPO/bin/marginalia' hook session-start codex"
   [ "$status" -eq 0 ] && [ -z "$output" ]
@@ -906,15 +969,14 @@ PY
   [ -L "$HOME/.agents/skills/marginalia-task" ]
 }
 
-@test "GEMINI_CLI_HOME：入口、hook 和 skills 都落在它下面" {
-  export GEMINI_CLI_HOME="$BATS_TEST_TMPDIR/ghome"
-  mkdir -p "$GEMINI_CLI_HOME/.gemini"
+@test "config agents：agy 的 skills 目录就是共享目录时，禁用 agy 不删共享 skills" {
+  mkdir -p "$HOME/.agents/skills" "$HOME/.gemini/antigravity-cli"
+  ln -s "$HOME/.agents/skills" "$HOME/.gemini/skills"
   mg setup
-  grep -q "marginalia:start" "$GEMINI_CLI_HOME/.gemini/GEMINI.md"
-  [ -e "$GEMINI_CLI_HOME/.gemini/settings.json" ]
-  [ -L "$GEMINI_CLI_HOME/.agents/skills/marginalia-task" ]
-  mg uninstall
-  [ ! -e "$GEMINI_CLI_HOME/.agents/skills/marginalia-task" ]
+  [ -L "$HOME/.agents/skills/marginalia-task" ]
+  mg config --user agents claude
+  mg setup
+  [ -L "$HOME/.agents/skills/marginalia-task" ] && [ -L "$HOME/.gemini/skills" ]
 }
 
 @test "init：agents 配置不合法时一开始就报错，不写任何文件" {
